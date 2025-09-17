@@ -26,9 +26,9 @@
 *                 different platforms
 *
 *******************************************************************************/
-#include "../include/brcm_ldisc_sh.h"
+#include "brcm_ldisc_sh.h"
 
-#ifdef LPM_BLUESLEEP
+#if defined(LPM_BLUESLEEP) && defined(CONFIG_BT_MSM_SLEEP)
 //#include <net/bluetooth/bluesleep.h>
 void bluesleep_outgoing_data(void);
 int bluesleep_start(void);
@@ -41,7 +41,7 @@ void bluesleep_stop(void);
  **/
 void brcm_btsleep_wake( enum sleep_type type)
 {
-#ifdef LPM_BLUESLEEP
+#if defined(LPM_BLUESLEEP) && defined(CONFIG_BT_MSM_SLEEP)
     if(type == SLEEP_BLUESLEEP)
          bluesleep_outgoing_data();
 #endif
@@ -52,7 +52,7 @@ void brcm_btsleep_wake( enum sleep_type type)
 **/
 int brcm_btsleep_start(enum sleep_type type)
 {
-#ifdef LPM_BLUESLEEP
+#if defined(LPM_BLUESLEEP) && defined(CONFIG_BT_MSM_SLEEP)
     if(type == SLEEP_BLUESLEEP)
         return bluesleep_start();
 #endif
@@ -63,7 +63,7 @@ int brcm_btsleep_start(enum sleep_type type)
  */
 void brcm_btsleep_stop(enum sleep_type type)
 {
-#ifdef LPM_BLUESLEEP
+#if defined(LPM_BLUESLEEP) && defined(CONFIG_BT_MSM_SLEEP)
     if(type == SLEEP_BLUESLEEP)
         bluesleep_stop();
 #endif
