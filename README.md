@@ -6,7 +6,7 @@ This is a revision of Broadcom V4L2 BT/FM combo driver ported from drivers/bluet
 
 2. The original implementation also includes packet snooping for debugging, but this function has never been enabled (and therefore has never been checked and confirmed working) throughout my testing. 
    
-3. Only limited tests have been conducted with my device; so while you are welcome to apply/adapt it to other use cases, please do verify its correctness/robustness and **use it at your own risk**.
+3. Only limited tests have been conducted with my device; so while you are welcome to apply/adapt it to other use cases, please do verify its correctness/robustness and ***use it at your own risk***.
 
 ## Changes
 1. Allowing for HCI packets transmitted in a sequence of small fragments between the userspace and BT protocol driver (and in turn Line Discipline driver), so all components remain functional no matter how packets are read/written. \
@@ -18,12 +18,12 @@ This is a revision of Broadcom V4L2 BT/FM combo driver ported from drivers/bluet
    This change helps to simplify the original implementation, where each sender had to build its own way of synchronisation with synchronisation points (where waiting actually happens) scattered around the code. However, it should be noted that this new synchronisation mechanism is realised by matching responses with requests of the same "sync ids" generated based on their packet type + opcode; as a result, it still fails to distinguish responses in some edge cases (as the original implementation did), like two consecutive responses of the same type and the same opcode are received in reply to two consecutive requests, but the second request might end up matching the first response as the first request happened to be sent in "asynchronous mode".
    
 3. The use of spin locks has been largely revised to
-   * Reduce the sizes of critical sections
-   * Remove unnecessary on/off switches on interrupts, as all locks are supposed to be used in the context of "kernel processes/threads"
-   * Be not spin-locked when sleeping might be triggered (e.g. copy_to_user() is going to be called)
+   * Reduce the sizes of critical sections.
+   * Remove unnecessary on/off switches on interrupts, as all locks are supposed to be used in the context of "kernel processes/threads".
+   * Be not spin-locked when sleeping might be triggered (e.g. copy_to_user() is going to be called).
    
 4. tx/rx queuing is streamlined so that only one queue is used for each direction (a shared tx queue is installed at Line Discipline driver, while BT protocol driver and V4L2 FM driver are both equipped
-   with a rx queue)
+   with a rx queue).
    
 5. Exposing the interface (via V4L2 control) of configuring FM radio with regional band presets defined by V4L2 FM driver.
 
@@ -54,9 +54,9 @@ In my case, drivers are compiled under a kernel tree, and this can be done by
    CONFIG_BCM_COMBO_LINE_DISCIPLINE=y
    CONFIG_BCM_COMBO_V4L2_FM=y
    ```
-   are included in the configuration
+   are included in the configuration.
    
-5. Perform the kernel/module build as desired
+5. Perform the kernel/module build as desired.
 
 ## Diagram
 Please be cognizant of the requirement that these drivers have to collaborate with other modules/userspace apps to become fully functional. As an illustration, below is a simple diagram showing all components involved in my setup targeting lineage-18.1 OS: \
