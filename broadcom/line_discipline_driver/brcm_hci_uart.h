@@ -28,18 +28,23 @@
 #ifndef BRCM_HCI_UART_H
 #define BRCM_HCI_UART_H
 
+#include <uapi/linux/tty.h>
 #include <linux/platform_device.h>
 #include <linux/firmware.h>
-#include "../include/brcm_ldisc_sh.h"
-#include "../include/v4l2_target.h"
+#include "brcm_ldisc_sh.h"
+#include "v4l2_target.h"
+#include "v4l2_logs.h"
 
-#define TRUE 1
-#define FALSE 0
 
 /*****************************************************************************
 **  Constants & Macros
 *****************************************************************************/
 
+/*
+ * Note: do not assume N_BRCM_HCI = 25,
+ * as global headers (like tty.h) might already define this
+ * macro to another value
+ */
 #ifndef N_BRCM_HCI
 #define N_BRCM_HCI      25
 #endif
@@ -50,74 +55,34 @@
 #define HCIUARTGETDEVICE    _IOR('U', 202, int)
 
 /* UART protocols */
-#define HCI_UART_MAX_PROTO      5
+#define HCI_UART_MAX_PROTO      1
 
-/* #define HCI_UART_H4    0*/
-#define HCI_UART_BCSP           1
-#define HCI_UART_3WIRE          2
-#define HCI_UART_H4DS           3
-#define HCI_UART_LL             4
 #define HCI_UART_BRCM           0
 
-/* HCI_UART flag bits */
-#define HCI_UART_PROTO_SET      0
 
-/* TX states  */
-#define HCI_UART_SENDING        1
-#define HCI_UART_TX_WAKEUP      2
-
-#define LOCAL_NAME_BUFFER_LEN  32
-#define UART_DEV_NAME_LEN      32
 #define VENDOR_PARAMS_LEN 300
 
-/* time in msec to wait for
- * line discipline to be installed
- */
-#define LDISC_TIME             1500
-#define CMD_RESP_TIME          800
-#define CMD_WR_TIME            1000
-#define POR_RETRY_COUNT        5
+/* Debug/Error Messaging */
+#ifndef BTLDISC_DEBUG
+#define BTLDISC_DEBUG TRUE
+#endif
 
+#if (BTLDISC_DEBUG)
+#define BRCM_LDISC_DBG(flag, fmt, arg...) \
+            do { \
+                if (ldisc_dbg_param & flag) \
+                    printk(KERN_DEBUG "(brcmhci):%s:%d  "fmt"\n" , \
+                                               __func__, __LINE__, ## arg); \
+            } while(0)
+#else
+#define BRCM_LDISC_DBG(flag,fmt, arg...)
+#endif
 
-/* states of protocol list */
-#define LDISC_NOTEMPTY          1
-#define LDISC_EMPTY             0
+#define BRCM_LDISC_ERR(fmt, arg...)  printk(KERN_ERR "(brcmhci):%s:%d  "fmt"\n" , \
+                                           __func__, __LINE__,## arg)
 
-/*
- * possible st_states
- */
-#define LDISC_INITIALIZING      1
-#define LDISC_REG_IN_PROGRESS   2
-#define LDISC_REG_PENDING       3
-#define LDISC_WAITING_FOR_RESP  4
+extern int ldisc_dbg_param;
 
-/* HCI pkt event and command codes */
-#define HCI_FM_PKT           0x08
-
-/* Max size of HCI packet */
-#define V4L2_HCI_PKT_MAX_SIZE 1050
-
-/* time for workaround in msec to wait for closed tty */
-#define TTY_CLOSE_TIME          20000
-
-struct brcm_struct {
-    unsigned long rx_state;
-    unsigned long rx_count;
-    struct sk_buff *rx_skb;
-    struct sk_buff_head txq;
-    spinlock_t hcibrcm_lock;          /* HCIBRCM state lock */
-    unsigned long hcibrcm_state;      /* HCIBRCM power state */
-    unsigned short is_there_activity;
-    unsigned short inactive_period;
-    struct sk_buff_head tx_wait_q;    /* HCIBRCM wait queue */
-
-    void* hu;
-    char resp_buffer[30];
-};
-
-
-typedef struct hci_uart_proto hci_uart_proto;
-typedef struct hci_uart hci_uart;
 
 struct hci_uart_proto {
     unsigned int id;
@@ -125,36 +90,26 @@ struct hci_uart_proto {
     int (*close)(struct hci_uart *hu);
     int (*flush)(struct hci_uart *hu);
     int (*recv)(struct hci_uart *hu, void *data, int len);
-    int (*recv_int)(struct hci_uart *hu, void *data, int len);
     int (*enqueue)(struct hci_uart *hu, struct sk_buff *skb);
     struct sk_buff *(*dequeue)(struct hci_uart *hu);
 };
+
+struct hci_uart_proto_desc;
 
 struct hci_uart {
     struct tty_struct *tty;
     struct hci_dev *hdev;
     unsigned long flags;
 
-    struct hci_uart_proto *proto;
-    struct brcm_struct *priv;
-    void *hdr_data;
+    struct hci_uart_proto_desc *curr_proto_desc;
 
-#if V4L2_SNOOP_ENABLE
-    void *snoop_hdr_data;
-#endif
+    spinlock_t component_descs_lock;
+    struct component_desc *component_descs[COMPONENT_MAX];
+    unsigned char components_registered;
 
-    struct sk_buff        *tx_skb;
-    unsigned long sh_ldisc_state;
-    unsigned long        tx_state;
-    spinlock_t        rx_lock;
-    struct sh_proto_s *list[PROTO_SH_MAX];
-    bool is_registered[PROTO_SH_MAX];
-    unsigned char    protos_registered;
-    spinlock_t lock;
+    struct completion ldisc_installed;
+    struct completion ldisc_patchram_complete;
 
-    struct completion cmd_rcvd, ldisc_installed, ldisc_patchram_complete,
-                uim_baudrate_set_complete;
-    char resp_buffer[30];
     struct platform_device *brcm_pdev;
     const struct firmware *fw_entry;
 
@@ -163,7 +118,10 @@ struct hci_uart {
     unsigned char ldisc_fm_err;
     spinlock_t err_lock;
 
-    //vendor params as comma separated string , read from bt_vendor.conf
+    /* 
+     * vendor params represented as a comma-separated string
+     * read from bt_vendor.conf
+     */
     char vendor_params[VENDOR_PARAMS_LEN];
 
 #if V4L2_SNOOP_ENABLE
@@ -171,21 +129,12 @@ struct hci_uart {
     spinlock_t hcisnoop_write_lock;
 #endif
     struct completion tty_close_complete;
+
+    bool tx_on;
+    struct workqueue_struct *tx_wq;
+    struct work_struct tx_work;
 };
 
-typedef struct {
-    unsigned short          event;
-    unsigned short          len;
-    unsigned short          offset;
-    unsigned short          layer_specific;
-} hc_bt_hdr;
-
-
-/*****************************************************************************
-**  Functions
-*****************************************************************************/
-int brcm_init(void);
-int brcm_deinit(void);
 
 /*****************************************************************************
 **  Functions
@@ -193,47 +142,12 @@ int brcm_deinit(void);
 
 int brcm_hci_uart_register_proto(struct hci_uart_proto *p);
 int brcm_hci_uart_unregister_proto(struct hci_uart_proto *p);
-int brcm_hci_uart_tx_wakeup(struct hci_uart *hu);
-void brcm_hci_uart_route_frame(enum proto_type protoid,
-                                      struct hci_uart *hu, struct sk_buff *skb);
-void brcm_hci_process_frametype( register int frame_type,
-                               struct hci_uart*hu,struct sk_buff *skb,int count);
-
-/**
- * sh_ldisc_write -
- * internal write function, passed onto protocol drivers
- * via the write function ptr of protocol struct
- */
-long brcm_sh_ldisc_write(struct sk_buff *);
-
-/**
- * sh_ldisc_init -
- * internal init function, passed onto protocol drivers
- * via the init function ptr of protocol struct
- */
-/* ask for reference from KIM */
-void hu_ref(struct hci_uart **, int);
-long brcm_sh_ldisc_start(struct hci_uart *hu);
-long brcm_sh_ldisc_stop(struct hci_uart *hu, bool btsleep_open);
-
-#ifdef CONFIG_BT_HCIUART_H4
-int h4_init(void);
-int h4_deinit(void);
+void brcm_hci_uart_route_frame(struct hci_uart *hu, enum component_type comp_type, struct sk_buff *skb);
+#if V4L2_SNOOP_ENABLE
+int brcm_hci_snoop_send(struct hci_uart *hu, struct hci_snoop_hdr *snoop_hdr, const unsigned char* data, unsigned int log_flag);
 #endif
 
-#ifdef CONFIG_BT_HCIUART_BCSP
-int bcsp_init(void);
-int bcsp_deinit(void);
-#endif
-
-#ifdef CONFIG_BT_HCIUART_LL
-int ll_init(void);
-int ll_deinit(void);
-#endif
-
-#ifdef CONFIG_BT_HCIUART_BRCM
 int brcm_init(void);
 int brcm_deinit(void);
-#endif
 
-#endif
+#endif // BRCM_HCI_UART_H

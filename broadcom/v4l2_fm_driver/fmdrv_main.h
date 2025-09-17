@@ -99,18 +99,10 @@
 **  Type definitions
 *******************************************************************************/
 
-/* SKB helpers */
-struct fm_skb_cb {
-    __u8 fm_opcode;
-    struct completion *completion;
-};
-
-#define fm_cb(skb) ((struct fm_skb_cb *)(skb->cb))
-
 /* FM Channel-8 command message format */
 struct fm_cmd_msg_hdr {
     __u8 header;        /* Logical Channel-8 */
-    __u16 cmd;          /* vendor specific command */
+    __le16 cmd;          /* vendor specific command */
     __u8 len;           /* Number of bytes follows */
     __u8 fm_opcode;     /* FM Opcode */
     __u8 rd_wr;         /* Read/Write command */
@@ -120,13 +112,13 @@ struct fm_cmd_msg_hdr {
 /* FM Channel-8 command message format */
 struct fm_vsc_hci_cmd_msg_hdr {
     __u8 header;        /* Logical Channel-8 */
-    __u16 cmd;          /* vendor specific command */
+    __le16 cmd;          /* vendor specific command */
     __u8 len;           /* Number of bytes follows */
 } __attribute__ ((packed));
 
 
-#define FM_CMD_MSG_HDR_SIZE    6    /* sizeof(struct fm_cmd_msg_hdr) */
-#define FM_VSC_HCI_CMD_MSG_HDR_SIZE    4
+#define FM_CMD_MSG_HDR_SIZE    sizeof(struct fm_cmd_msg_hdr)
+#define FM_VSC_HCI_CMD_MSG_HDR_SIZE    sizeof(struct fm_vsc_hci_cmd_msg_hdr)
 
 
 
@@ -137,7 +129,7 @@ struct fm_event_msg_hdr {
     __u8 len;           /* Number of bytes follows */
 } __attribute__ ((packed));
 
-#define FM_EVT_MSG_HDR_SIZE     3 /* sizeof(struct fm_event_msg_hdr) */
+#define FM_EVT_MSG_HDR_SIZE     sizeof(struct fm_event_msg_hdr)
 struct fm_cmd_complete_hdr {
     struct hci_ev_cmd_complete hci_cmd_complete;
     __u8 status;
@@ -145,7 +137,7 @@ struct fm_cmd_complete_hdr {
     __u8 rd_wr;
 } __attribute__ ((packed));
 
-#define FM_CMD_COMPLETE_HDR_SIZE     6 /* sizeof(struct fm_cmd_complete_hdr ) */
+#define FM_CMD_COMPLETE_HDR_SIZE     sizeof(struct fm_cmd_complete_hdr )
 
 /* Converts little endian to big endian */
 #define FM_STORE_LE16_TO_BE16(data, value)   \
@@ -226,14 +218,6 @@ struct fm_cmd_complete_hdr {
 #define FM_RX_RDS_AF_SWITCH_MODE_ON 1
 #define FM_RX_RDS_AF_SWITCH_MODE_OFF 0
 
-/* Band types */
-#define FM_BAND_EUROPE      0
-#define FM_BAND_JAPAN       1
-#define FM_BAND_NA          2
-#define FM_BAND_RUSSIAN     3
-#define FM_BAND_CHINA       4
-#define FM_BAND_ITALY       5
-#define FM_BAND_WEATHER     6
 
 /* noise floor estimation */
 #define     FM_NFE_DEFAILT      93      /* default Noise floor value */
@@ -252,14 +236,6 @@ struct fm_cmd_complete_hdr {
 
 /* SNR threshold max */
 #define FM_RX_SNR_MAX      31
-
-/* FM RDS modes */
-#define FM_RDS_DISABLE    0
-#define FM_RDS_ENABLE    1
-
-/* FM RBDS modes */
-#define FM_RDBS_DISABLE 0
-#define FM_RDBS_ENABLE  1
 
 /* RDS system type (RDS/RBDS) */
 #define FM_RDS_SYSTEM_NONE  0
@@ -327,6 +303,9 @@ enum
 
 typedef unsigned char tBRCM_RDS_QUALITY;
 
+/* Forward declaration */
+struct poll_table_struct;
+struct fmdrv_ops;
 /*******************************************************************************
 **  Functions
 *******************************************************************************/
@@ -335,9 +314,7 @@ typedef unsigned char tBRCM_RDS_QUALITY;
 int fmc_prepare(struct fmdrv_ops *);
 int fmc_release(struct fmdrv_ops *);
 
-void fmc_update_region_info(struct fmdrv_ops *, unsigned char);
-int fmc_send_cmd(struct fmdrv_ops *, unsigned char, void *, int,unsigned char,
-            struct completion *, void *, int *);
+int fmc_send_cmd(struct fmdrv_ops *, unsigned char, void *, int,unsigned char, void *, int *);
 
 int fmc_set_frequency(struct fmdrv_ops *, unsigned int);
 int fmc_set_mode(struct fmdrv_ops *, unsigned char);
@@ -351,12 +328,10 @@ int fmc_get_audio_mode(struct fmdrv_ops *fmdev, unsigned char *audio_mode);
 int fmc_get_mode(struct fmdrv_ops *, unsigned char *);
 int fmc_enable (struct fmdrv_ops *, unsigned char);
 int fmc_turn_fm_off(struct fmdrv_ops *);
-int fmc_turn_fm_on (struct fmdrv_ops *, unsigned char);
+int fmc_turn_fm_on (struct fmdrv_ops *, bool);
 int fmc_set_scan_step(struct fmdrv_ops *, unsigned char);
-int fmc_transfer_rds_from_cbuff(struct fmdrv_ops *, struct file *,
-                    char __user *, size_t);
-void fmc_reset_rds_cache(struct fmdrv_ops *);
-void get_rds_element_value(int ioctl_num, char __user *ioctl_value);
+ssize_t fmc_transfer_rds_from_cbuff(struct fmdrv_ops *, struct file *, char __user *, size_t);
+int fmc_is_rds_data_available(struct fmdrv_ops *, struct file *, struct poll_table_struct *);
+int fmc_get_rds_element_value(int, void __user *);
 
 #endif
-

@@ -34,6 +34,8 @@ struct fm_event_hdr {
 
 #define FM_MAX_FRAME_SIZE 0xFF
 #define FM_EVENT_HDR_SIZE 2
-#define FM_CH8_PKT 0x8
+
+/* custom HCI pkt type for some FM messages */
+#define HCI_FM_PKT           0x08
 
 #endif

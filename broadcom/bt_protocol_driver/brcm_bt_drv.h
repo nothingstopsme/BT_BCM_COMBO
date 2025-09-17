@@ -28,11 +28,9 @@
 
 #ifndef _BT_DRV_H
 #define _BT_DRV_H
-#include <net/bluetooth/bluetooth.h>
 #include <linux/interrupt.h>
-
-#define TRUE   1
-#define FALSE  0
+#include "v4l2_target.h"
+#include "v4l2_logs.h"
 
 #define WORKER_QUEUE TRUE
 
@@ -43,13 +41,37 @@
 #define BT_REGISTER_TIMEOUT   msecs_to_jiffies(6000)    /* 6 sec */
 
 /* BT driver's local status */
-#define BT_DRV_RUNNING     0
-#define BT_ST_REGISTERED   1
-#define BT_TX_Q_EMPTY      2
-#define BT_RX_Q_EMPTY      3
+#define BT_ST_REGISTERED   0
+#define BT_RX_ONGOING      2
+#define BT_TX_ONGOING      3
+#define BT_DEV_OPENING     4
+#define BT_DEV_CLOSING     5
 
 
 #define BRCM_BT_DEV_MAJOR 0
+
+
+#ifndef BTDRV_DEBUG
+#define BTDRV_DEBUG TRUE
+#endif
+
+
+/* Debug/Error Messaging for BT protocol driver */
+#if BTDRV_DEBUG
+#define BT_DRV_DBG(flag, fmt, arg...) \
+        do { \
+            if (bt_dbg_param & flag) \
+                printk(KERN_DEBUG "(btdrv):%s  "fmt"\n" , \
+                                           __func__,## arg); \
+        } while(0)
+#else
+    #define BT_DRV_DBG(flag, fmt, arg...)
+#endif
+
+#define BT_DRV_ERR(fmt, arg...)  printk(KERN_ERR "(btdrv):%s  "fmt"\n" , \
+                                           __func__,## arg)
+
+extern int bt_dbg_param;
 
 struct brcm_bt_dev {
     /*register device to linux system*/
@@ -59,60 +81,15 @@ struct brcm_bt_dev {
     /* used locally,to maintain various BT driver status */
     unsigned long flags;
 
-    /* to hold ST registration callback  status */
-    char streg_cbdata;
-
-    /* write function pointer of Line discipline driver */
-    long (*st_write) (struct sk_buff *);
-
-    /* Wait on comepletion handler needed to synchronize
-        * hci_st_open() and hci_st_registration_completion_cb()
-        * functions.*/
-    struct completion wait_for_btdrv_reg_completion;
-
 
     long flag;                           /*  BT driver state machine info */
     struct sk_buff_head rx_q;            /* RX queue */
-    spinlock_t rx_q_lock;                /* Rx queue lock */
 
-    struct sk_buff_head tx_q;            /* TX queue */
+    struct rx_tx_desc curr_tx;
 
-    struct workqueue_struct *tx_wq;     /* Fm drv workqueue */
-    struct work_struct tx_workqueue;    /* Tx work queue */
-
-    spinlock_t tx_q_lock;                /* Tx queue lock */
-
-    unsigned long last_tx_jiffies;       /* Timestamp of last pkt sent */
-    atomic_t tx_cnt;                     /* Number of packets in tx queue */
-
-    /* queue for polling table */
+    /* queue for polling */
     wait_queue_head_t inq;
-
 };
-
-
-
-/* declare functions used in brcm_bt_drv */
-static int brcm_bt_drv_open(struct inode *inode, struct file *filp);
-
-static int brcm_bt_drv_close(struct inode *i, struct file *f);
-
-static void brcm_bt_drv_prepare(struct brcm_bt_dev* bt_dev);
-
-static ssize_t brcm_bt_drv_read(struct file *f, char __user *buf, size_t
-  len, loff_t *off);
-
-static ssize_t brcm_bt_write(struct file *f, const char __user *buf,
-  size_t len, loff_t *off);
-
-static void brcm_bt_st_registration_completion_cb(void *priv_data,
-    char data);
-
-static long brcm_bt_st_receive(void *priv_data, struct sk_buff *skb);
-
-static void bt_send_data_ldisc(struct work_struct *work);
-
-
 
 #endif
 

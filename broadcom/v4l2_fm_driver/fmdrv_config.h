@@ -30,6 +30,7 @@
 #ifndef _FM_DRV_CONFIG_H
 #define _FM_DRV_CONFIG_H
 
+#include "v4l2_target.h"
 #include "fm_public.h"
 #include "fmdrv_main.h"
 #include <media/v4l2-common.h>
@@ -38,8 +39,19 @@
 **  Constants & Macros
 *******************************************************************************/
 
-/* Set default World region */
-#define DEF_V4L2_FM_WORLD_REGION FM_REGION_NA
+/* Whether to turn on debug prints;
+ * note that fm_dbg_param module parameter
+ * controls what types of debug messages
+ * which can be actually printed,
+ * so it also needs to be set in order to
+ * see messages of particular types
+ */
+#ifndef V4L2_FM_DEBUG
+#define V4L2_FM_DEBUG TRUE
+#endif
+
+/* Set default band */
+#define DEF_V4L2_FM_BAND FM_BAND_NA
 
 /* Set default Audio mode */
 #define DEF_V4L2_FM_AUDIO_MODE FM_AUTO_MODE

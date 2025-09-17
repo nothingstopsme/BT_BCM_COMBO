@@ -33,11 +33,11 @@
 int fm_rx_set_frequency(struct fmdrv_ops*, unsigned int);
 int fm_rx_set_band_frequencies(struct fmdrv_ops *, unsigned int, unsigned int);
 int fm_rx_set_mute_mode(struct fmdrv_ops*, unsigned char);
-int fm_rx_set_rds_system(struct fmdrv_ops *, unsigned char);
+int fm_rx_set_rds_system(struct fmdrv_ops *, bool);
 int fm_rx_set_volume(struct fmdrv_ops*, unsigned short);
 int fm_rx_set_audio_ctrl(struct fmdrv_ops *,unsigned short);
 
-int fm_rx_set_audio_mode(struct fmdrv_ops *, unsigned char);
+int fm_rx_set_audio_mode(struct fmdrv_ops *, unsigned char, unsigned char);
 int fm_rx_set_region(struct fmdrv_ops*, unsigned char);
 int fm_rx_set_scan_step(struct fmdrv_ops *, unsigned char);
 int fm_rx_config_audio_path(struct fmdrv_ops *, unsigned char);
@@ -55,7 +55,7 @@ int fm_rx_get_band_frequencies(struct fmdrv_ops *,
                     unsigned int *, unsigned int *);
 int fm_rx_seek_station(struct fmdrv_ops *, unsigned char, unsigned char);
 int fm_rx_read_curr_rssi_freq(struct fmdrv_ops *, unsigned char);
-void fm_rx_enable_rds(struct fmdrv_ops *);
+void fm_rx_enable_rds(struct fmdrv_ops *, bool enabling);
 int fm_rx_is_rds_data_available(struct fmdrv_ops *, struct file *,
                     struct poll_table_struct *);
 

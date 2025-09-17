@@ -29,32 +29,33 @@
 
 #ifndef LDISC_SH_H
 #define LDISC_SH_H
-
+#include <net/bluetooth/bluetooth.h>
+#include <net/bluetooth/hci.h>
 #include <linux/skbuff.h>
 #define CONFIG_BT_HCIUART_BRCM
 
 /*******************************************************************************
 **  Constants
 *******************************************************************************/
-/* install sysfs entry values */
-#define V4L2_STATUS_ERR '2'  // error occured in BT application (HCI command timeout or HW error)
-#define V4L2_STATUS_ON  '1'  // Atleast one procol driver is registered
-#define V4L2_STATUS_OFF '0'  // No procol drivers registered
 
-/* BT err flag values (bt_err) */
-#define  V4L2_ERR_FLAG_RESET '0'
-#define  V4L2_ERR_FLAG_SET   '1'
+
+/* HCIBRCM rx/tx States */
+#define HCIBRCM_W4_PACKET_TYPE 0
+#define HCIBRCM_W4_HEADER      1
+#define HCIBRCM_PEEKING_DATA   2
+#define HCIBRCM_W4_DATA        3
+
 
 /*
- * enum proto-type - The protocol on chips which share a
+ * enum component_type - various components on the chip which share a
  *  common physical interface like UART.
  */
-enum proto_type {
-    PROTO_SH_BT,
-    PROTO_SH_FM,
-    PROTO_SH_GPS,
-    PROTO_SH_ANT,
-    PROTO_SH_MAX,
+enum component_type {
+    COMPONENT_BT,
+    COMPONENT_FM,
+    COMPONENT_GPS,
+    COMPONENT_ANT,
+    COMPONENT_MAX,
 };
 
 /*
@@ -77,46 +78,53 @@ void brcm_btsleep_stop(enum sleep_type type);
 **  Type definitions
 *******************************************************************************/
 
-/*
- * Skb helpers
- */
-struct sh_ldisc_skb_cb {
-    __u8 pkt_type;
-    __u32 lparam;
+struct hci_snoop_hdr {
+    unsigned short          event;
+    unsigned short          len;
+    unsigned short          offset;
+    unsigned short          layer_specific;
+} __attribute__ ((packed));
+
+struct rx_tx_desc {
+    unsigned char state;
+    __u32 remaining;
+    enum component_type comp_type;
+    struct hci_snoop_hdr snoop_hdr;
+    struct sk_buff *skb;
 };
 
+struct sh_ldisc_skb_cb {
+    enum component_type comp_type;
+} __attribute__ ((packed));
+
 /**
- * struct sh_proto_s - Per Protocol structure from BT/FM/GPS to shared ldisc
+ * struct component_interface - the interface to BT/FM/GPS component registerd to the shared ldisc
  * @type: type of the protocol being registered among the
  *  available proto_type(BT, FM, GPS the protocol which share TTY).
  * @recv: the receiver callback pointing to a function in the
  *  protocol drivers called by the shared ldisc driver upon receiving
  *  relevant data.
  * @match_packet: reserved for future use, to make ST more generic
- * @reg_complete_cb: callback handler pointing to a function in protocol
- *  handler called by shared ldisc when the pending registrations are complete.
- *  The registrations are marked pending, in situations when fw
- *  download is in progress.
+ * @extract_sync_id: if provided, called to extract the id of the input skb
+ *  based on its content; used in synchronous sending to match responses
+ *  with requests of the same id
  * @write: pointer to function in shared ldisc provided to protocol drivers,
  *  to be made use when protocol drivers have data to send to TTY.
- * @priv_data: privdate data holder for the protocol drivers, sent
- *  from the protocol drivers during registration, and sent back on
- *  reg_complete_cb and recv.
  */
-struct sh_proto_s {
-    enum proto_type type;
-    long (*recv) (void *, struct sk_buff *);
+struct component_interface {
+    enum component_type type;
+    long (*recv) (struct sk_buff *);
     unsigned char (*match_packet) (const unsigned char *data);
-    void (*reg_complete_cb) (void *, char data);
-    long (*write) (struct sk_buff *skb);
-    void *priv_data;
+    __u32 (*extract_sync_id) (struct sk_buff *);
+    struct sk_buff *(*write) (struct sk_buff *skb, bool never_blocking);
 };
 
 /*******************************************************************************
-**  Extern variables and functions
+** macro/inline/extern functions
 *******************************************************************************/
 
-extern long brcm_sh_ldisc_register(struct sh_proto_s *);
-extern long brcm_sh_ldisc_unregister(enum proto_type, bool btsleep_open);
+extern long brcm_sh_ldisc_register(struct component_interface *);
+extern long brcm_sh_ldisc_unregister(enum component_type, bool btsleep_open);
+
 
 #endif /* LDISC_H */

@@ -113,10 +113,12 @@
 #define FM_RDS_END_TUPLE_2ND_BYTE    0xff /* 2nd byte of a RDS ending tuple */
 #define FM_RDS_END_TUPLE_3RD_BYTE    0xff /* 3rd byte of a RDS ending tuple */
 
+#if 0
 /* FM/RDS flag bits used with fm_dev->rx.fm_rds_flag */
 #define     FM_RDS_FLAG_CLEAN_BIT         0x01    /* clean FM_RDS_FLAG register */
 #define     FM_RDS_FLAG_SCH_FRZ_BIT     0x02    /* interrupt freeze */
 #define     FM_RDS_FLAG_SCH_BIT             0x04    /* pending search_tune */
+#endif
 
 #define     FM_RDS_UPD_TUPLE            64       /* 64 tuples per read(64*3 = 192 bytes),
                                                     one tuple contains 1 RDS block  */
@@ -128,6 +130,22 @@
 #define FALSE 0
 
 #define WORKER_QUEUE TRUE
+
+/* Debug/Error Messaging for V4L2 FM driver */
+#if V4L2_FM_DEBUG
+#define V4L2_FM_DRV_DBG(flag, fmt, arg...) \
+        do { \
+            if (fm_dbg_param & flag) \
+                printk(KERN_DEBUG "(v4l2fmdrv):%s  "fmt"\n" , \
+                                           __func__,## arg); \
+        } while(0)
+#else
+#define V4L2_FM_DRV_DBG(flag, fmt, arg...)
+#endif
+#define V4L2_FM_DRV_ERR(fmt, arg...)  printk(KERN_ERR "(v4l2fmdrv):%s  "fmt"\n" , \
+                                           __func__,## arg)
+
+extern int fm_dbg_param;
 
 enum {
     FM_MODE_OFF,
@@ -152,12 +170,13 @@ enum fm_seek_tune_state
 *******************************************************************************/
 
 /* FM region (Europe/US, Japan) info */
-struct region_info {
+struct band_info {
     unsigned short  low_bound;   /* lowest frequency boundary */
     unsigned short  high_bound;     /* highest frequency boundary */
     unsigned char   deemphasis;     /* FM de-emphasis time constant */
     unsigned char    scan_step;      /* scanning step */
     unsigned char    fm_band;
+    unsigned char   rds_support;       /* RDS support */
 };
 
 /* RDS info */
@@ -170,12 +189,13 @@ struct fm_rds {
     unsigned int rd_index;
     unsigned char *cbuffer;
 
+    spinlock_t cbuff_lock;        /* To protect access to RDS Circular buffer */
 };
 
 /* FM RX mode info */
 struct fm_rx {
-    struct region_info region;      /* Current selected band */
-    unsigned char curr_region;
+    struct band_info band_config;      /* Current selected band */
+    unsigned char curr_band;
     unsigned int curr_freq;         /* Current RX frquency */
     unsigned char curr_mute_mode;   /* Current mute mode */
     unsigned short curr_volume;     /* Current volume level */
@@ -189,17 +209,16 @@ struct fm_rx {
     unsigned char audio_path;
     unsigned short aud_ctrl;
     unsigned char pcm_reg;
-    unsigned char sch_step;
     unsigned char seek_direction;
     unsigned char seek_wrap;
     unsigned char curr_search_state;
     unsigned short fm_rds_mask;     /* FM/RDS interrupt mask */
-    unsigned short fm_rds_flag;     /* FM/RDS interrupt flag */
-    unsigned char fm_func_mask;
+
     struct fm_rds rds;
 
+
     u8 af_mode;         /* Alternate frequency on/off */
-    u8 no_of_chans;     /* Number stations found */
+    //u8 no_of_chans;     /* Number stations found */
     char current_pins[3]; /*Current pins configuration. either I2S or PCM*/
 };
 
@@ -215,45 +234,22 @@ struct fm_device_info {
 struct fmdrv_ops {
     struct video_device *radio_dev;   /* V4L2 video device pointer */
     struct v4l2_device v4l2_dev;      /* V4L2 top level struct */
-    spinlock_t resp_skb_lock;         /* To protect access to received SKB */
-    spinlock_t rds_cbuff_lock;        /* To protect access to RDS Circular buffer */
 
     long flag;                         /*  FM driver state machine info */
     struct sk_buff_head rx_q;          /* RX queue */
 
-    struct workqueue_struct *tx_wq;     /* Fm workqueue */
-    struct work_struct tx_workqueue;    /* Tx work queue */
+
     struct workqueue_struct *rx_wq;     /* Fm workqueue */
-    struct work_struct rx_workqueue;    /* Rx work queue */
+    struct work_struct rx_work;    /* Rx work queue */
 
-    struct sk_buff_head tx_q;          /* TX queue */
-
-    unsigned long last_tx_jiffies;  /* Timestamp of last pkt sent */
-    atomic_t tx_cnt;                         /* Number of packets can send at a time */
-
-    struct sk_buff *response_skb;   /* Response from the chip */
-    /* Main task completion handler */
-    struct completion maintask_completion;
     /* Seek task completion handler */
     struct completion seektask_completion;
-    /* Opcode of last command sent to the chip */
-    unsigned char last_sent_pkt_opcode;
-    /* Handler used for wakeup when response packet is received */
-    struct completion *response_completion;
+
     unsigned char curr_fmmode;   /* Current FM chip mode (TX, RX, OFF) */
     unsigned char aud_ctrl;     /* Current Audio Control (STEREO/MONO/NONE) */
     struct fm_rx rx;                         /* FM receiver info */
     struct fm_device_info device_info; /* FM Device info */
-};
 
-#define GET_PI_CODE     1
-#define GET_TP_CODE     2
-#define GET_PTY_CODE    3
-#define GET_TA_CODE     4
-#define GET_MS_CODE     5
-#define GET_PS_CODE     6
-#define GET_RT_MSG      7
-#define GET_CT_DATA     8
-#define GET_TMC_CHANNEL 9
+};
 
 #endif

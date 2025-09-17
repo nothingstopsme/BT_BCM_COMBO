@@ -34,5 +34,8 @@ struct ant_event_hdr {
 
 #define ANT_MAX_FRAME_SIZE 0xFF
 #define ANT_EVENT_HDR_SIZE 2
-#define ANT_PKT 0x0f
+
+/* custom HCI pkt type for some ANT messages */
+#define HCI_ANT_PKT 0x0f
+
 #endif

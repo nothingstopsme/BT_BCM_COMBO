@@ -32,20 +32,19 @@
 **  Constants & Macros
 *******************************************************************************/
 
-#define    FM_REGION_EUR    0x00
-#define    FM_REGION_JP     0x01
-#define    FM_REGION_NA     0x02
-#define    FM_REGION_RUS    0x03
-#define    FM_REGION_CHN    0x04
-#define    FM_REGION_IT     0x05
+/* Band types */
+#define FM_BAND_EUROPE      0
+#define FM_BAND_JAPAN       1
+#define FM_BAND_NA          2
+#define FM_BAND_RUSSIAN     3
+#define FM_BAND_CHINA       4
+#define FM_BAND_ITALY       5
+#define FM_BAND_MAX         FM_BAND_ITALY
 
-#define    FM_RDS_BIT       1<<4
-#define    FM_RBDS_BIT      1<<5
-#define    FM_AF_BIT        1<<6
 
-#define     FM_REGION_MAX           FM_REGION_JP
-/* low 3 bits (bit0, 1)of FUNC mask is region code */
-#define     FM_REGION_MASK          (FM_REGION_NA | FM_REGION_EUR)
+#define    FM_RDS_BIT       0x01
+#define    FM_RBDS_BIT      0x02
+#define    FM_AF_BIT        0x04
 
 /* FM audio output mode */
 enum
@@ -91,5 +90,33 @@ enum
 #ifndef TRUE
 #define TRUE  1
 #endif
+
+/* RDS data query type;
+ * the values also correspond to bit positions in the event mask
+ * for indicate the availability of the associated rds data
+ */
+enum RdsQueryType {
+    GET_EVENT_MASK = 0,
+    GET_PI_CODE = 1,
+    GET_TP_CODE,
+    GET_PTY_CODE,
+    GET_TA_CODE,
+    GET_MS_CODE,
+    GET_PS_CODE,
+    GET_RT_MSG,
+    GET_CT_DATA,
+    GET_TMC_CHANNEL,
+};
+
+#define RDS_QUERY_TYPE_TO_EVENT_MASK(type) (((__u32)1) << (type-1))
+
+#define RDS_EVENT_PI_CODE RDS_QUERY_TYPE_TO_EVENT_MASK(GET_PI_CODE)
+#define RDS_EVENT_TP RDS_QUERY_TYPE_TO_EVENT_MASK(GET_TP_CODE)
+#define RDS_EVENT_PTY RDS_QUERY_TYPE_TO_EVENT_MASK(GET_PTY_CODE)
+#define RDS_EVENT_TA RDS_QUERY_TYPE_TO_EVENT_MASK(GET_TA_CODE)
+#define RDS_EVENT_MS RDS_QUERY_TYPE_TO_EVENT_MASK(GET_MS_CODE)
+#define RDS_EVENT_PS RDS_QUERY_TYPE_TO_EVENT_MASK(GET_PS_CODE)
+#define RDS_EVENT_RT RDS_QUERY_TYPE_TO_EVENT_MASK(GET_RT_MSG)
+#define RDS_EVENT_CT RDS_QUERY_TYPE_TO_EVENT_MASK(GET_CT_DATA)
 
 #endif

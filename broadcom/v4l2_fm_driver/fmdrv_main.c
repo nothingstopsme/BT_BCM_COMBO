@@ -39,96 +39,102 @@
 
 #include <linux/module.h>
 #include <linux/delay.h>
+#include "fmdrv_config.h"
 #include "fmdrv.h"
 #include "fmdrv_v4l2.h"
 #include "fmdrv_main.h"
-#include "../include/brcm_ldisc_sh.h"
+#include "brcm_ldisc_sh.h"
 #include "fmdrv_rx.h"
 #include "fm_public.h"
-#include "fmdrv_config.h"
-#include "../include/v4l2_target.h"
-#include "../include/v4l2_logs.h"
+#include "v4l2_logs.h"
 
-#ifndef V4L2_FM_DEBUG
-#define V4L2_FM_DEBUG TRUE
-#endif
 
 /* set this module parameter to enable debug info */
 int fm_dbg_param = 0;
 
 /* Region info */
-struct region_info region_configs[] = {
-     /* Europe */
+const struct band_info band_configs[] = {
+    /* Europe */
     {
-     .low_bound = FM_GET_FREQ(8750),    /* 87.5 MHz */
-     .high_bound = FM_GET_FREQ(10800),    /* 108 MHz */
-     .deemphasis = FM_DEEMPHA_50U,
-     .scan_step = 100,
-     .fm_band = 0,
-     },
+        .low_bound = FM_GET_FREQ(8750),    /* 87.5 MHz */
+        .high_bound = FM_GET_FREQ(10800),    /* 108 MHz */
+        .deemphasis = FM_DEEMPHA_50U,
+        .scan_step = FM_STEP_100KHZ,
+        .fm_band = FM_BAND_EUROPE,
+        .rds_support = FM_RDS_BIT,
+    },
 
     /* Japan */
     {
-     .low_bound = FM_GET_FREQ(7600),    /* 76 MHz */
-     .high_bound = FM_GET_FREQ(10800),    /* 108 MHz */
-     .deemphasis = FM_DEEMPHA_50U,
-     .scan_step = 100,
-     .fm_band = 1,
-     },
+        .low_bound = FM_GET_FREQ(7600),    /* 76 MHz */
+        .high_bound = FM_GET_FREQ(10800),    /* 108 MHz */
+        .deemphasis = FM_DEEMPHA_50U,
+        .scan_step = FM_STEP_100KHZ,
+        .fm_band = FM_BAND_JAPAN,
+        .rds_support = FM_RDS_BIT,
+    },
 
-     /* North America */
-     {
-      .low_bound = FM_GET_FREQ(8750),    /* 87.5 MHz */
-      .high_bound = FM_GET_FREQ(10800),    /* 108 MHz */
-      .deemphasis = FM_DEEMPHA_75U,
-      .scan_step = 200,
-      },
-
-     /* Russia-Ext */
+    /* North America */
     {
-     .low_bound = FM_GET_FREQ(6580),    /* 65.8 MHz */
-     .high_bound = FM_GET_FREQ(10800),    /* 108 MHz */
-     .deemphasis = FM_DEEMPHA_75U,
-     .scan_step = 100,
+        .low_bound = FM_GET_FREQ(8750),    /* 87.5 MHz */
+        .high_bound = FM_GET_FREQ(10800),    /* 108 MHz */
+        .deemphasis = FM_DEEMPHA_75U,
+        .scan_step = FM_STEP_200KHZ,
+        .fm_band = FM_BAND_NA,
+        .rds_support = FM_RBDS_BIT,
+    },
+
+    /* Russia-Ext */
+    {
+        .low_bound = FM_GET_FREQ(6580),    /* 65.8 MHz */
+        .high_bound = FM_GET_FREQ(10800),    /* 108 MHz */
+        .deemphasis = FM_DEEMPHA_75U,
+        .scan_step = FM_STEP_100KHZ,
+        .fm_band = FM_BAND_RUSSIAN,
+        .rds_support = FM_RDS_BIT,
     },
 
     /* China Region */
     {
-     .low_bound = FM_GET_FREQ(7600),    /* 76 MHz */
-     .high_bound = FM_GET_FREQ(10800),    /* 108 MHz */
-     .deemphasis = FM_DEEMPHA_75U,
-     .scan_step = 100,
-     },
+        .low_bound = FM_GET_FREQ(7600),    /* 76 MHz */
+        .high_bound = FM_GET_FREQ(10800),    /* 108 MHz */
+        .deemphasis = FM_DEEMPHA_75U,
+        .scan_step = FM_STEP_100KHZ,
+        .fm_band = FM_BAND_CHINA,
+        .rds_support = FM_RDS_BIT,
+    },
 
     /* Italy/Thailand */
     {
-     .low_bound = FM_GET_FREQ(8750),    /* 87.5 MHz */
-     .high_bound = FM_GET_FREQ(10800),    /* 108 MHz */
-     .deemphasis = FM_DEEMPHA_50U,
-     .scan_step = 50,
-     .fm_band = 0,
-     },
+        .low_bound = FM_GET_FREQ(8750),    /* 87.5 MHz */
+        .high_bound = FM_GET_FREQ(10800),    /* 108 MHz */
+        .deemphasis = FM_DEEMPHA_50U,
+        .scan_step = FM_STEP_50KHZ,
+        .fm_band = FM_BAND_ITALY,
+        .rds_support = FM_RDS_BIT,
+    },
 };
 
-#if V4L2_FM_DEBUG
-#define V4L2_FM_DRV_DBG(flag, fmt, arg...) \
-        do { \
-            if (fm_dbg_param & flag) \
-                printk(KERN_DEBUG "(v4l2fmdrv):%s  "fmt"\n" , \
-                                           __func__,## arg); \
-        } while(0)
-#else
-#define V4L2_FM_DRV_DBG(flag, fmt, arg...)
-#endif
-#define V4L2_FM_DRV_ERR(fmt, arg...)  printk(KERN_ERR "(v4l2fmdrv):%s  "fmt"\n" , \
-                                           __func__,## arg)
+/*******************************************************************************
+**  Forward function declarations
+*******************************************************************************/
+
+static int parse_inrpt_flags(struct fmdrv_ops *fmdev, struct sk_buff *skb);
+static int parse_rds_data(struct fmdrv_ops *fmdev, struct sk_buff *skb);
+static void send_read_intrp_cmd(struct fmdrv_ops *fmdev);
+static int read_rds_data(struct fmdrv_ops *);
+
+static long fm_st_receive(struct sk_buff *skb);
+static __u32 fm_extract_sync_id(struct sk_buff *skb);
+
 
 /*******************************************************************************
 **  Static Variables
 *******************************************************************************/
-   //#define BTYES_TO_UINT16(u16, lsb, msb) {u16 = (UINT16)(((UINT16)(lsb) << 8) + (UINT16)(msb)); }
-   /* Program Type */
-   static char *pty_str[]= {"None", "News", "Current Affairs",
+//#define BTYES_TO_UINT16(u16, lsb, msb) {u16 = (UINT16)(((UINT16)(lsb) << 8) + (UINT16)(msb)); }
+/* Program Type */
+static const char * const pty_str[]= {
+                         "None", "News", "Current Affairs",
                          "Information","Sport", "Education",
                          "Drama", "Culture","Science",
                          "Varied Speech", "Pop Music",
@@ -141,44 +147,61 @@ struct region_info region_configs[] = {
                          "National Music","Oldies","Folk",
                          "Documentary", "Alarm Test", "Alarm"};
 
+static struct {
    /*These are the RDS elements that we are intested to parse*/
    /*Each variable represents one RDS element*/
-   /*pi_code_b   -Program Identification code*/
-   static __u32 pi_code_b = 1;
+   /*pi_code   -Program Identification code*/
+   __u16 pi_code;
    /* pty  --Program Type, Actually an integer value is transmitted and */
    /* if we pass the value to pty_str, we get the appropriate string */
-   static __u32 pty =2;
+   __u8 pty:5;
    /*tp*/
-   static __u32 tp =3;
+   __u8 tp:1;
    /*ta */
-   static __u32 ta =4;
+   __u8 ta:1;
    /*ms_code, a bit represneting Music or Speech*/
-   static __u32 ms_code =5;
-   /*rds_psn is the Program name in string format, max length is 8 bytes + null terminate */
-   static char rds_psn[9];
-   /*rds_txt is RDS test message, this could be custom message*/
-   static char rds_txt[65];
-   /*holds the 3 byte RDS tuple data*/
-   static __u8 rds_tupple[3];
+   __u8 ms_code:1;
 
-   static __u8 psn_const_flags = 0x00;
-   static __u8 skip_flag = 1;
+   /*ps is the program/station name in string format, max length is 8 bytes + null terminate */
+   char ps[9];
+   /*rt is radio text message, this could be custom message*/
+   char rt[65];
+
+   /*holds the 3 byte RDS tuple data*/
+   __u8 rds_tuple[3];
+
+   __u8 skip_flag:1;
+   __u8 rt_AB:1;
+
+   __u8 ps_markers;
+   __u16 rt_markers;
+   __u16 rt_checkers;
+
+
+   __u32 events;
 
    /*CT is time and date information*/
-   struct ct
+   struct
    {
       __u32 day;
-      __u32 hour;
-      __u32 minute;
-      __u32 second;
-   };
-/*Global to store the CT information after parsing it from RDS stream*/
-   static struct ct current_ct;
+      __u8 hour;
+      __u8 minute;
 
+      __u8 hoffset_reserved:2;
+      __u8 hoffset_sign:1;
+      __u8 hoffset_magnitude:5;
+   } ct;
+} rds_parser = { .skip_flag = 1 };
+
+/*Global to store the CT information after parsing it from RDS stream*/
+//   static struct ct current_ct;
+
+#if 0
 /* Band selection */
 static unsigned char default_radio_region;    /* US */
 module_param(default_radio_region, byte, 0);
 MODULE_PARM_DESC(default_radio_region, "Region: 0=US, 1=Europe, 2=Japan");
+#endif
 
 /* RDS buffer blocks */
 static unsigned int default_rds_buf = 300;
@@ -190,16 +213,19 @@ static int radio_nr = -1;
 module_param(radio_nr, int, 0);
 MODULE_PARM_DESC(radio_nr, "Radio Nr");
 
-/*******************************************************************************
-**  Forward function declarations
-*******************************************************************************/
-
-long (*g_bcm_write) (struct sk_buff *skb);
-
-int parse_inrpt_flags(struct fmdrv_ops *fmdev);
-int parse_rds_data(struct fmdrv_ops *fmdev);
-void send_read_intrp_cmd(struct fmdrv_ops *fmdev);
-int read_rds_data(struct fmdrv_ops *);
+/* Defining the info for registering with the ldisc driver;
+ * note that some fields would get updated later in the registration proces
+ */
+static struct {
+  struct component_interface interface;
+  struct fmdrv_ops *fmdev;
+} fm_comp_def = {
+    .interface = {
+        .type = COMPONENT_FM,
+        .extract_sync_id = fm_extract_sync_id,
+        .recv = fm_st_receive
+    }
+};
 
 /*******************************************************************************
 **  Functions
@@ -214,8 +240,8 @@ inline void dump_tx_skb_data(struct sk_buff *skb)
     struct fm_cmd_msg_hdr *cmd_hdr;
 
     cmd_hdr = (struct fm_cmd_msg_hdr *)skb->data;
-    V4L2_FM_DRV_DBG(V4L2_DBG_TX, "<<%shdr:%02x len:%02x opcode:%02x type:%s", \
-           fm_cb(skb)->completion ? " " : "*", cmd_hdr->header, \
+    V4L2_FM_DRV_DBG(V4L2_DBG_TX, "<<hdr:%02x len:%02x opcode:%02x type:%s", \
+           cmd_hdr->header, \
            cmd_hdr->len, cmd_hdr->fm_opcode, \
            cmd_hdr->rd_wr ? "RD" : "WR");
 
@@ -257,327 +283,191 @@ inline void dump_rx_skb_data(struct sk_buff *skb)
 #endif
 
 /*
- * Store the currently set region
- */
-void fmc_update_region_info(struct fmdrv_ops *fmdev,
-                unsigned char region_to_set)
-{
-    V4L2_FM_DRV_DBG(V4L2_DBG_TX, "fmc_update_region_info");
-    fmdev->rx.curr_region = region_to_set;
-    memcpy(&fmdev->rx.region, &region_configs[region_to_set],
-        sizeof(struct region_info));
-    fmdev->rx.curr_freq = fmdev->rx.region.low_bound;
-    fm_rx_config_deemphasis( fmdev,fmdev->rx.region.deemphasis);
-}
-
-/*
 * FM common sub-module will schedule this tasklet whenever it receives
 * FM packet from ST driver.
 */
 static void fm_receive_data_ldisc(struct work_struct *w)
 {
-    struct fmdrv_ops *fmdev = container_of(w, struct fmdrv_ops,rx_workqueue);
+    struct fmdrv_ops *fmdev = container_of(w, struct fmdrv_ops,rx_work);
     struct fm_event_msg_hdr *fm_evt_hdr;
     struct sk_buff *skb;
-    unsigned long flags;
-    unsigned char sub_event, *p;
 
     /* Process all packets in the RX queue */
-    while ((skb = skb_dequeue(&fmdev->rx_q)))
-    {
-        if (skb->len < sizeof(struct fm_event_msg_hdr))
-        {
-            pr_err("(fmdrv): skb(%p) has only %d bytes"
-                            "atleast need %lu bytes to decode",
-                                        skb, skb->len,
-                                (unsigned long)sizeof(struct fm_event_msg_hdr));
-            kfree_skb(skb);
-            continue;
-        }
-#ifdef FM_DUMP_TXRX_PKT
-        dump_rx_skb_data(skb);
-#endif
+    while (true) {
+
+        spin_lock(&fmdev->rx_q.lock);
+        skb = __skb_dequeue(&fmdev->rx_q);
+        spin_unlock(&fmdev->rx_q.lock);
+
+        if (!skb)
+            break;
+
         fm_evt_hdr = (void *)skb->data;
-        if (fm_evt_hdr->event_id == HCI_EV_CMD_COMPLETE)
-        {
-            struct fm_cmd_complete_hdr *cmd_complete_hdr;
-            cmd_complete_hdr = (struct fm_cmd_complete_hdr *) &skb->data [FM_EVT_MSG_HDR_SIZE];
-            /*parsing the Opcode FC61 response since it is sent by */
-            /*FM driver to switch I2S path. Unlike other FM commands*/
-            /*FC61 response comes with HCI event*/
-            if (((unsigned char )skb->data[4] == 0x61) &&
-                ((unsigned char )skb->data[5] == 0xfc) &&
-                (&fmdev->maintask_completion != NULL))
-            {
-                spin_lock_irqsave(&fmdev->resp_skb_lock, flags);
-                fmdev->response_skb = skb;
-                spin_unlock_irqrestore(&fmdev->resp_skb_lock, flags);
-                complete(fmdev->response_completion);
-                fmdev->response_completion = NULL;
-                atomic_set(&fmdev->tx_cnt, 1);
+        switch (fm_evt_hdr->event_id) {
+            case HCI_EV_CMD_COMPLETE: {
+                // In this case, the skb must be of fm_cmd_complete type
+                struct fm_cmd_complete_hdr *fmcmd_complete_hdr = (struct fm_cmd_complete_hdr *)(fm_evt_hdr+1);
+                switch (fmcmd_complete_hdr->fm_opcode) {
+                    /* Parse the interrupt flags in 0x12 */
+                    case FM_REG_FM_RDS_FLAG: {
+                        parse_inrpt_flags(fmdev, skb);
+                        /* the ownership of skb has been taken over in parse_inrpt_flags() */
+                        skb = NULL;
+                        break;
+                    }
+                    case FM_REG_RDS_DATA: {
+                        parse_rds_data(fmdev, skb);
+                        /* the ownership of skb has been taken over in parse_rds_data() */
+                        skb = NULL;
+                        break;
+                    }
+                    default:
+                        break;
+                }
+
+                break;
             }
-            /* Anyone waiting for this with completion handler? */
-            else if (cmd_complete_hdr->fm_opcode == fmdev->last_sent_pkt_opcode &&
-                                fmdev->response_completion != NULL)
-            {
-                if (fmdev->response_skb != NULL)
-                    pr_err("(fmdrv): Response SKB ptr not NULL");
+            case BRCM_FM_VS_EVENT: {
+                unsigned char sub_event = *(unsigned char *)(fm_evt_hdr+1);
 
-                if(cmd_complete_hdr->fm_opcode == FM_REG_FM_RDS_MSK)
-                    fmdev->rx.fm_rds_flag &= ~FM_RDS_FLAG_SCH_FRZ_BIT;
+                V4L2_FM_DRV_DBG(V4L2_DBG_RX, ": Got Vendor specific Event");
+                if(sub_event == BRCM_VSE_SUBCODE_FM_INTERRUPT)
+                {
+                    V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(fmdrv) VSE Interrupt event for FM received. Calling fmc_send_intrp_cmd().");
+                    send_read_intrp_cmd(fmdev);
+                }
 
-                spin_lock_irqsave(&fmdev->resp_skb_lock, flags);
-                fmdev->response_skb = skb;
-                spin_unlock_irqrestore(&fmdev->resp_skb_lock, flags);
-                complete(fmdev->response_completion);
-
-                fmdev->response_completion = NULL;
-                atomic_set(&fmdev->tx_cnt, 1);
+                break;
             }
-            /* This is the VSE interrupt handler case */
-            else if (cmd_complete_hdr->fm_opcode == fmdev->last_sent_pkt_opcode &&
-                                    fmdev->response_completion == NULL)
-            {
-                V4L2_FM_DRV_DBG(V4L2_DBG_RX,"(fmdrv) : VSE interrupt handler case for 0x%x", \
-                                    cmd_complete_hdr->fm_opcode);
-                if (fmdev->response_skb != NULL)
-                    pr_err("(fmdrv): Response SKB ptr not NULL");
-                spin_lock_irqsave(&fmdev->resp_skb_lock, flags);
-                fmdev->response_skb = skb;
-                spin_unlock_irqrestore(&fmdev->resp_skb_lock, flags);
-                /* Parse the interrupt flags in 0x12 */
-                if(cmd_complete_hdr->fm_opcode == FM_REG_FM_RDS_FLAG)
-                    parse_inrpt_flags(fmdev);
-                else if(cmd_complete_hdr->fm_opcode == FM_REG_RDS_DATA)
-                    parse_rds_data(fmdev);
-
-                atomic_set(&fmdev->tx_cnt, 1);
-            }
+            default:
+                break;
         }
-        else if(fm_evt_hdr->event_id == BRCM_FM_VS_EVENT) /* Vendor specific Event */
-        {
-            V4L2_FM_DRV_DBG(V4L2_DBG_RX, ": Got Vendor specific Event");
-            p = &skb->data[FM_EVT_MSG_HDR_SIZE];
 
-            /* Check if this is a FM vendor specific event */
-            STREAM_TO_UINT8(sub_event, p);
-            if(sub_event == BRCM_VSE_SUBCODE_FM_INTERRUPT)
-            {
-                V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(fmdrv) VSE Interrupt event for FM received. Calling fmc_send_intrp_cmd().");
-                send_read_intrp_cmd(fmdev);
-            }
-        }
-        else
-        {
-            pr_err("Unhandled packet SKB(%p),purging", skb);
-        }
-        if (!skb_queue_empty(&fmdev->tx_q))
-		queue_work(fmdev->tx_wq,&fmdev->tx_workqueue);
-    }
-}
-
-/*
-* FM send tasklet: is scheduled when
-* FM packet has to be sent to chip */
-static void fm_send_data_ldisc(struct work_struct *w)
-{
-    struct fmdrv_ops *fmdev =container_of(w, struct fmdrv_ops,tx_workqueue);
-    struct sk_buff *skb;
-    int len;
-
-    /* Send queued FM TX packets */
-    if (atomic_read(&fmdev->tx_cnt))
-    {
-        skb = skb_dequeue(&fmdev->tx_q);
         if (skb)
-        {
-            atomic_dec(&fmdev->tx_cnt);
-            fmdev->last_sent_pkt_opcode = fm_cb(skb)->fm_opcode;
-
-            if (fmdev->response_completion != NULL)
-                    pr_err("(fmdrv): Response completion handler"
-                                "is not NULL");
-
-            fmdev->response_completion = fm_cb(skb)->completion;
-               /* SYED : Hack to set the right packet type for FM */
-            sh_ldisc_cb(skb)->pkt_type = FM_PKT_LOGICAL_CHAN_NUMBER;
-
-        }
-
-            /* Write FM packet to hci shared ldisc driver */
-            len = g_bcm_write(skb);
-            if (len < 0)
-            {
-                kfree_skb(skb);
-                fmdev->response_completion = NULL;
-                pr_err("(fmdrv): TX tasklet failed to send" \
-                                "skb(%p)", skb);
-                atomic_set(&fmdev->tx_cnt, 1);
-            }
-            else {
-                fmdev->last_tx_jiffies = jiffies;
-            }
-        }
+            kfree_skb(skb);
     }
+}
 
-
-/* Queues FM Channel-8 packet to FM TX queue and schedules FM TX tasklet for
- * transmission */
-static int __fm_send_cmd(struct fmdrv_ops *fmdev, unsigned char fmreg_index,
+/* Sending FM Channel-8/VSC HCI packet to ldisc driver for tx transmission */
+static struct sk_buff* __fm_send_cmd(struct fmdrv_ops *fmdev, unsigned char fmreg_index,
                 void *payload, int payload_len, unsigned char type,
-                struct completion *wait_completion)
+                bool waiting_for_resp)
 {
-    struct sk_buff *skb;
-    struct fm_cmd_msg_hdr *cmd_hdr;
+    struct sk_buff *skb, *resp = NULL;
     int size;
 
-    size = FM_CMD_MSG_HDR_SIZE + ((payload == NULL) ? 0 : payload_len);
-    skb = alloc_skb(size, GFP_ATOMIC);
+    if (!fm_comp_def.interface.write) {
+        V4L2_FM_DRV_ERR("%s Error!!! fm_comp_def.interface.write is NULL", __func__);
+        return ERR_PTR(-ENOENT);
+    }
+
+    if(type == VSC_HCI_CMD) {
+        size = FM_VSC_HCI_CMD_MSG_HDR_SIZE + ((payload == NULL) ? 0 : payload_len);
+    }
+    else {
+        size = FM_CMD_MSG_HDR_SIZE + ((payload == NULL) ? 0 : payload_len);
+    }
+
+    skb = alloc_skb(size, GFP_KERNEL);
     if (!skb)
     {
-        pr_err("(fmdrv): No memory to create new SKB");
-        return -ENOMEM;
+        V4L2_FM_DRV_ERR("No memory to create new SKB");
+        return ERR_PTR(-ENOMEM);
     }
 
     /* Fill command header info */
-    cmd_hdr =(struct fm_cmd_msg_hdr *)skb_put(skb, FM_CMD_MSG_HDR_SIZE);
+    if (type == VSC_HCI_CMD) {
+        struct fm_vsc_hci_cmd_msg_hdr *cmd_hdr =(struct fm_vsc_hci_cmd_msg_hdr *)skb_put(skb, FM_VSC_HCI_CMD_MSG_HDR_SIZE);
 
-    cmd_hdr->header = HCI_COMMAND;    /* 0x01 */
-    /* 3 (cmd, len, fm_opcode,rd_wr) */
-    cmd_hdr->cmd = hci_opcode_pack(HCI_GRP_VENDOR_SPECIFIC, FM_2048_OP_CODE);
+        cmd_hdr->header = HCI_COMMAND;    /* 0x01 */
 
-    cmd_hdr->len = ((payload == NULL) ? 0 : payload_len) + 2;
-    /* FM opcode */
-    cmd_hdr->fm_opcode = fmreg_index;
-    /* read/write type */
-    cmd_hdr->rd_wr = type;
+        cmd_hdr->cmd = __cpu_to_le16(hci_opcode_pack(HCI_GRP_VENDOR_SPECIFIC, VSC_HCI_WRITE_PCM_PINS_OCF));
+        cmd_hdr->len = 0x05;  /*Fixed value for FC61 command*/
 
-    fm_cb(skb)->fm_opcode = fmreg_index;
+    } else {
+        struct fm_cmd_msg_hdr *cmd_hdr =(struct fm_cmd_msg_hdr *)skb_put(skb, FM_CMD_MSG_HDR_SIZE);
 
-    if (payload != NULL)
-            memcpy(skb_put(skb, payload_len), payload, payload_len);
+        cmd_hdr->header = HCI_COMMAND;    /* 0x01 */
 
-    fm_cb(skb)->completion = wait_completion;
-
-//    print skb->cb to check pck_type and completion.
-
-    skb_queue_tail(&fmdev->tx_q, skb);
-    queue_work(fmdev->tx_wq,&fmdev->tx_workqueue);
-
-    return 0;
-}
-
-/* QueuesVSC HCI packet to FM TX queue and schedules FM TX tasklet for
- * transmission */
-static int __fm_send_vsc_hci_cmd(struct fmdrv_ops *fmdev,__u16 ocf_value,
-                void *payload, int payload_len, struct completion *wait_completion)
-{
-    struct sk_buff *skb;
-    struct fm_cmd_msg_hdr *cmd_hdr;
-    int size;
-    unsigned char *ch  = (unsigned char*)payload;
-
-    size = FM_VSC_HCI_CMD_MSG_HDR_SIZE + ((payload == NULL) ? 0 : payload_len);
-    skb = alloc_skb(size, GFP_ATOMIC);
-    if (!skb)
-    {
-        pr_err("(fmdrv): No memory to create new SKB");
-        return -ENOMEM;
+        cmd_hdr->cmd = __cpu_to_le16(hci_opcode_pack(HCI_GRP_VENDOR_SPECIFIC, FM_2048_OP_CODE));
+        /* FM opcode */
+        cmd_hdr->fm_opcode = fmreg_index;
+        /* read/write type */
+        cmd_hdr->rd_wr = type;
+        cmd_hdr->len = ((payload == NULL) ? 0 : payload_len) + 2;
     }
 
-    /* Fill command header info */
-    cmd_hdr =(struct fm_cmd_msg_hdr *)
-                skb_put(skb, FM_VSC_HCI_CMD_MSG_HDR_SIZE);
-
-    cmd_hdr->header = HCI_COMMAND;    /* 0x01 */
-    /* 3 (cmd, len, fm_opcode,rd_wr) */
-    cmd_hdr->cmd = hci_opcode_pack(HCI_GRP_VENDOR_SPECIFIC, ocf_value);
-
-    cmd_hdr->len = 0x05;  /*Fixed value for FC61 command*/
+    /* SYED : Hack to set the right packet type for FM */
+    sh_ldisc_cb(skb)->comp_type = COMPONENT_FM;
 
     if (payload != NULL)
-        memcpy(skb_put(skb, payload_len), ch, payload_len);
+        memcpy(skb_put(skb, payload_len), payload, payload_len);
+    resp = fm_comp_def.interface.write(skb, !waiting_for_resp /* never_blocking */);
 
-    fm_cb(skb)->completion = wait_completion;
+    if (IS_ERR(resp)) {
+        V4L2_FM_DRV_ERR("Failed to send a tx skb(%p)", skb);
+        kfree_skb(skb);
+    }
 
-    skb_queue_tail(&fmdev->tx_q, skb);
+    return resp;
 
-    queue_work(fmdev->tx_wq,&fmdev->tx_workqueue);
-
-    return 0;
 }
 
-
-/* Sends FM Channel-8 command to the chip and waits for the reponse */
+/* Sends FM Channel-8 command to the chip and waits for the response */
 int fmc_send_cmd(struct fmdrv_ops *fmdev, unsigned char fmreg_index,
             void *payload, int payload_len, unsigned char type,
-            struct completion *wait_completion, void *reponse,
-            int *reponse_len)
+            void *response, int *response_len)
 {
     struct sk_buff *skb;
     struct fm_event_msg_hdr *fm_evt_hdr;
-    struct fm_cmd_complete_hdr *cmd_complete_hdr;
-    unsigned long timeleft;
-    unsigned long flags;
     int ret;
 
-    //V4L2_FM_DRV_DBG("In fmc_send_cmd");
+    V4L2_FM_DRV_DBG(V4L2_DBG_TX, "In fmc_send_cmd");
 
-    init_completion(wait_completion);
-    if(type == VSC_HCI_CMD)
-    {
-        ret = __fm_send_vsc_hci_cmd(fmdev, VSC_HCI_WRITE_PCM_PINS_OCF, payload,
-                            payload_len, wait_completion);
-        if (ret < 0)
-           return ret;
-    }
-    else
-    {
-        ret = __fm_send_cmd(fmdev, fmreg_index, payload, payload_len, type,
-                            wait_completion);
-        if (ret < 0)
-           return ret;
-    }
-
-    timeleft = wait_for_completion_timeout(wait_completion,
-            msecs_to_jiffies(FM_DRV_TX_TIMEOUT));
-    if (!timeleft)
-    {
-        pr_err("(fmdrv): Timeout(%d sec),didn't get reg"
-                            "completion signal from RX tasklet",
-                                        jiffies_to_msecs(FM_DRV_TX_TIMEOUT) / 1000);
-        return -ETIMEDOUT;
-    }
-    if (!fmdev->response_skb) {
-        pr_err("(fmdrv): Reponse SKB is missing ");
+    skb = __fm_send_cmd(fmdev, fmreg_index, payload, payload_len, type, true /* waiting_for_resp */);
+    if (IS_ERR(skb))
+        return PTR_ERR(skb);
+    else if (skb == NULL) {
+        V4L2_FM_DRV_ERR("(fmdrv): Reponse SKB is missing ");
         return -EFAULT;
     }
-    spin_lock_irqsave(&fmdev->resp_skb_lock, flags);
-    skb = fmdev->response_skb;
-    fmdev->response_skb = NULL;
-    spin_unlock_irqrestore(&fmdev->resp_skb_lock, flags);
 
     fm_evt_hdr = (void *)skb->data;
     if (fm_evt_hdr->event_id == HCI_EV_CMD_COMPLETE) /* Vendor specific command response */
     {
-        cmd_complete_hdr = (struct fm_cmd_complete_hdr *) &skb->data [FM_EVT_MSG_HDR_SIZE];
-        if (cmd_complete_hdr->status != 0)
+        int data_size, full_header_size = FM_EVT_MSG_HDR_SIZE;
+        struct hci_ev_cmd_complete *cmd_complete_hdr = (struct hci_ev_cmd_complete *)(fm_evt_hdr+1);
+        __u8 status = *(__u8 *)(cmd_complete_hdr+1);
+        if (status != 0)
         {
-            pr_err("(fmdrv): Reponse status not success ");
+            V4L2_FM_DRV_ERR("(fmdrv): Reponse status not success ");
             kfree (skb);
             return -EFAULT;
         }
 
-        //V4L2_FM_DRV_DBG("(fmdrv): Reponse status success : %d ", cmd_complete_hdr->status);
-        /* Send reponse data to caller */
-        if (reponse != NULL && reponse_len != NULL && fm_evt_hdr->len) {
-            /* Skip header info and copy only response data */
-            skb_pull(skb, (FM_EVT_MSG_HDR_SIZE + FM_CMD_COMPLETE_HDR_SIZE));
-            memcpy(reponse, skb->data, (fm_evt_hdr->len - FM_CMD_COMPLETE_HDR_SIZE) );
-            *reponse_len = (fm_evt_hdr->len - FM_CMD_COMPLETE_HDR_SIZE) ;
+        if (__le16_to_cpu(cmd_complete_hdr->opcode) == hci_opcode_pack(HCI_GRP_VENDOR_SPECIFIC, VSC_HCI_WRITE_PCM_PINS_OCF)) {
+            /*
+             * Adding 1 to treat the following status byte as
+             * part of the header
+             */
+            full_header_size += sizeof(*cmd_complete_hdr) + 1;
+            data_size = fm_evt_hdr->len - sizeof(*cmd_complete_hdr) - 1;
+        } else {
+            // __le16_to_cpu(cmd_complete_hdr->opcode) == hci_opcode_pack(HCI_GRP_VENDOR_SPECIFIC, FM_2048_OP_CODE)
+
+            full_header_size += FM_CMD_COMPLETE_HDR_SIZE;
+            data_size = fm_evt_hdr->len - FM_CMD_COMPLETE_HDR_SIZE;
         }
-        else if (reponse_len != NULL && fm_evt_hdr->len == 0) {
-            *reponse_len = 0;
+
+        /* Copying response data to caller */
+        if (response != NULL && response_len != NULL && data_size > 0) {
+            /* Skip header info and copy only response data */
+            skb_pull(skb, full_header_size);
+            memcpy(response, skb->data, data_size);
+            *response_len = data_size;
+        }
+        else if (response_len != NULL && data_size <= 0) {
+            *response_len = 0;
         }
     }
     else
@@ -588,61 +478,45 @@ int fmc_send_cmd(struct fmdrv_ops *fmdev, unsigned char fmreg_index,
     return 0;
 }
 
-/* This function has the necessity of calling when FM station changes.  */
-void reset_rds_parser(void)
+/* This function should be called when FM station changes
+ * and thus old rds info has to be erased
+ */
+static void reset_rds(struct fmdrv_ops *fmdev)
 {
-    pi_code_b = 1;
-    pty = 2;
-    tp = 3;
-    ta = 4;
-    ms_code = 5;
-    memset(rds_psn, 0x20, sizeof(rds_psn)-1);
-    memset(rds_txt, 0x20, sizeof(rds_txt)-1);
-    memset(rds_tupple, 0x00, sizeof(rds_tupple));
+    /* Clearing up rds parser */
+    memset(&rds_parser, 0, sizeof(rds_parser));
+    rds_parser.skip_flag = 1;
 
-    psn_const_flags = 0x00;
-    skip_flag = 1;
+    /* Clearing up rds circular buffer cache */
+    spin_lock(&fmdev->rx.rds.cbuff_lock);
+    //fmdev->rx.rds.rds_flag = FM_RDS_DISABLE;
+    fmdev->rx.rds.wr_index = 0;
+    fmdev->rx.rds.rd_index = 0;
+    spin_unlock(&fmdev->rx.rds.cbuff_lock);
+
+    fmdev->device_info.rxsubchans &= ~V4L2_TUNER_SUB_RDS;
+
 }
 
 /* Helper function to parse the interrupt bits
 * in FM_REG_FM_RDS_FLAG (0x12).
 * Called locally by fmdrv_main.c
 */
-int parse_inrpt_flags(struct fmdrv_ops *fmdev)
+static int parse_inrpt_flags(struct fmdrv_ops *fmdev, struct sk_buff *skb)
 {
-    struct sk_buff *skb;
-    unsigned long flags;
+    bool try_reset_mask = false;
     unsigned short fm_rds_flag;
     unsigned char response[2];
-
-    spin_lock_irqsave(&fmdev->resp_skb_lock, flags);
-    skb = fmdev->response_skb;
-    fmdev->response_skb = NULL;
-    spin_unlock_irqrestore(&fmdev->resp_skb_lock, flags);
 
     memcpy(&response, &skb->data[FM_EVT_MSG_HDR_SIZE + FM_CMD_COMPLETE_HDR_SIZE], 2);
     fm_rds_flag= (unsigned short)response[0] + ((unsigned short)response[1] << 8) ;
 
-    if (fmdev->rx.fm_rds_flag & (FM_RDS_FLAG_SCH_FRZ_BIT|FM_RDS_FLAG_CLEAN_BIT))
-    {
-        fmdev->rx.fm_rds_flag &= ~FM_RDS_FLAG_CLEAN_BIT;
-        V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv) : Clean BIT set. So no processing of the current"\
-            "FM/RDS flag set");
-        kfree_skb(skb);
-        return 0;
-    }
 
     V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv) Processing the interrupt flag. Flag read is 0x%x 0x%x",\
         response[0], response[1]);
     V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv) : flag register(0x%x)", fm_rds_flag);
     if(fm_rds_flag & (I2C_MASK_SRH_TUNE_CMPL_BIT|I2C_MASK_SRH_TUNE_FAIL_BIT))
     {
-        /* reset RDS parser */
-        reset_rds_parser();
-
-        /* remove sch_tune pending bit */
-        fmdev->rx.fm_rds_flag &= ~FM_RDS_FLAG_SCH_BIT;
-
         if(fm_rds_flag & I2C_MASK_SRH_TUNE_FAIL_BIT)
         {
             V4L2_FM_DRV_ERR("(fmdrv) MASK BIT : Search failure");
@@ -651,10 +525,9 @@ int parse_inrpt_flags(struct fmdrv_ops *fmdev)
                 fmdev->rx.curr_search_state = FM_STATE_SEEK_ERR;
                 complete(&fmdev->seektask_completion);
             }
-            else if(fmdev->rx.curr_search_state == FM_STATE_TUNING)
-            {
+            else if(fmdev->rx.curr_search_state == FM_STATE_TUNING) {
                 fmdev->rx.curr_search_state = FM_STATE_TUNE_ERR;
-                complete(&fmdev->maintask_completion);
+                complete(&fmdev->seektask_completion);
             }
         }
         else
@@ -663,312 +536,445 @@ int parse_inrpt_flags(struct fmdrv_ops *fmdev)
             if(fmdev->rx.curr_search_state == FM_STATE_SEEKING)
             {
                 fmdev->rx.curr_search_state = FM_STATE_SEEK_CMPL;
+
+                reset_rds(fmdev);
                 complete(&fmdev->seektask_completion);
             }
-            else if(fmdev->rx.curr_search_state == FM_STATE_TUNING)
-            {
+            else if(fmdev->rx.curr_search_state == FM_STATE_TUNING) {
                 fmdev->rx.curr_search_state = FM_STATE_TUNE_CMPL;
-                complete(&fmdev->maintask_completion);
+
+                reset_rds(fmdev);
+                complete(&fmdev->seektask_completion);
             }
         }
     }
-    else if((fm_rds_flag & (I2C_MASK_RDS_FIFO_WLINE_BIT|I2C_MASK_SYNC_LOST_BIT))
-            == I2C_MASK_RDS_FIFO_WLINE_BIT)
+    else if (fm_rds_flag & I2C_MASK_RDS_FIFO_WLINE_BIT)
     {
         V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv) Detected WLINE interrupt; Reading RDS.");
-        read_rds_data(fmdev);
+        if (read_rds_data(fmdev))
+            try_reset_mask = true;
     }
+    else {
+        try_reset_mask = true;
+    }
+
+    if (try_reset_mask) {
+        /*
+         * reactivating RDS retrieval if RDS is required
+         * so that we can continue getting the notification
+         */
+        if (fmdev->rx.fm_rds_mask & I2C_MASK_RDS_FIFO_WLINE_BIT)
+            fm_rx_set_mask(fmdev, fmdev->rx.fm_rds_mask);
+    }
+
     kfree_skb(skb);
     return 0;
 }
 
-void get_rds_element_value(int ioctl_num, char __user *ioctl_value)
+int fmc_get_rds_element_value(int ioctl_num, void __user *ioctl_value)
 {
 /* Even though the values that are returned from this function are global to this file */
 /* There is no need to lock  Since this is just a read operation */
 /* And we don't maitain the history of any of these values, we just return the */
 /* Current value irrespective of it's previous value */
-   __u8 *current_ct_buf;
-   current_ct_buf = (__u8 *)&current_ct;
+    __u8 tmp;
+    int ret = 0;
+    switch(ioctl_num)
+    {
+        case GET_EVENT_MASK: {
+            __u32 snapshot = rds_parser.events;
+            V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_EVENT_MASK");
+            if(copy_to_user(ioctl_value, &snapshot, sizeof(snapshot)))
+            {
+                V4L2_FM_DRV_ERR("(rds) Failed to copy PI code");
+                ret = -EIO;
+            }
 
-   if((ioctl_num > 9) || (ioctl_num <= 0))
-       return;
-
-   switch(ioctl_num)
-   {
-      case GET_PI_CODE:
-         if(copy_to_user(ioctl_value, (char *)&pi_code_b, 4))
-         {
-            V4L2_FM_DRV_ERR("(rds) Failed to copy PI code");
-         }
-         return;
-
-      case GET_TP_CODE:
-        if(copy_to_user(ioctl_value, (char *)&tp, 4))
-        {
-           V4L2_FM_DRV_ERR("(rds) Failed to copy TP code");
+            /*
+             * 1. Even though parser's event mask is updated here,
+             * it is still fine to conducted it without locking,
+             * as it doesn't really matter if there are events unread/uncleared
+             * 2. Only clearing events which have been copied
+             * to the user buffer
+             */
+            rds_parser.events &= ~snapshot;
+            break;
         }
-        return;
 
-      case GET_PTY_CODE:
-        if(copy_to_user(ioctl_value, (char *)&pty, 4))
-        {
-           V4L2_FM_DRV_ERR("(rds) Failed to copy PTY code");
+        case GET_PI_CODE:
+            V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_PI_CODE");
+            if(copy_to_user(ioctl_value, &rds_parser.pi_code, sizeof(rds_parser.pi_code)))
+            {
+                V4L2_FM_DRV_ERR("(rds) Failed to copy PI code");
+                ret = -EIO;
+            }
+            break;
+
+        case GET_TP_CODE:
+            V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_TP_CODE");
+            tmp = rds_parser.tp;
+            if(copy_to_user(ioctl_value, &tmp, sizeof(tmp)))
+            {
+                V4L2_FM_DRV_ERR("(rds) Failed to copy TP code");
+                ret = -EIO;
+            }
+            break;
+
+        case GET_PTY_CODE:
+            V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_PTY_CODE");
+            tmp = rds_parser.pty;
+            if(copy_to_user(ioctl_value, &tmp, sizeof(tmp)))
+            {
+                V4L2_FM_DRV_ERR("(rds) Failed to copy PTY code");
+                ret = -EIO;
+            }
+            break;
+
+        case GET_TA_CODE:
+            V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_TA_CODE");
+            tmp = rds_parser.ta;
+            if(copy_to_user(ioctl_value, &tmp, sizeof(tmp)))
+            {
+                V4L2_FM_DRV_ERR("(rds) Failed to copy TA code");
+                ret = -EIO;
+            }
+            break;
+
+        case GET_MS_CODE:
+            V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_MS_CODE");
+            tmp = rds_parser.ms_code;
+            if(copy_to_user(ioctl_value, &tmp, sizeof(tmp)))
+            {
+                V4L2_FM_DRV_ERR("(rds) Failed to copy MS code");
+                ret = -EIO;
+            }
+            break;
+
+        case GET_PS_CODE:
+            V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_PS_CODE");
+            if(copy_to_user(ioctl_value, rds_parser.ps, strlen(rds_parser.ps)+ 1))
+            {
+                V4L2_FM_DRV_ERR("(rds) Failed to copy PS code");
+                ret = -EIO;
+            }
+            break;
+
+        case GET_RT_MSG:
+            V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_RT_MSG");
+            if(copy_to_user(ioctl_value, rds_parser.rt, strlen(rds_parser.rt) + 1))
+            {
+                V4L2_FM_DRV_ERR("(rds) Failed to copy RT Message");
+                ret = -EIO;
+            }
+            break;
+
+        case GET_CT_DATA:
+            V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_CT_DATA");
+            if(copy_to_user(ioctl_value, &rds_parser.ct, sizeof(rds_parser.ct)))
+            {
+                V4L2_FM_DRV_ERR("(rds) Failed to copy CT data");
+                ret = -EIO;
+            }
+            break;
+
+        case GET_TMC_CHANNEL: {
+            V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_TMC_CHANNEL");
+            tmp = 4;
+            if(copy_to_user(ioctl_value, &tmp, sizeof(tmp)))
+            {
+                V4L2_FM_DRV_ERR("(rds) Failed to copy TMC_CHANNEL");
+                ret = -EIO;
+            }
+            break;
         }
-        return;
+        default:
+            ret = -EINVAL;
+            break;
+    }
 
-      case GET_TA_CODE:
-        if(copy_to_user(ioctl_value, (char *)&ta, 4))
-        {
-           V4L2_FM_DRV_ERR("(rds) Failed to copy TA code");
-        }
-        return;
-
-      case GET_MS_CODE:
-         if(copy_to_user(ioctl_value, (char *)&ms_code, 4))
-         {
-            V4L2_FM_DRV_ERR("(rds) Failed to copy MS code");
-         }
-         return;
-
-      case GET_PS_CODE:
-         if(copy_to_user(ioctl_value, rds_psn, strlen(rds_psn)+ 1))
-         {
-            V4L2_FM_DRV_ERR("(rds) Failed to copy PS code");
-         }
-         return;
-
-      case GET_RT_MSG:
-         if(copy_to_user(ioctl_value, rds_txt, strlen(rds_txt) + 1))
-         {
-            V4L2_FM_DRV_ERR("(rds) Failed to copy RT Message");
-         }
-         return;
-
-      case GET_CT_DATA:
-          if(copy_to_user(ioctl_value, (char *)current_ct_buf, 16))
-          {
-             V4L2_FM_DRV_ERR("(rds) Failed to copy CT data");
-          }
-          return;
-
-      case GET_TMC_CHANNEL:
-         *(__u32 *)ioctl_value = 4;
-         return;
-   }
+    return ret;
 }
 
 /* Each RDS packet is 104bytes = 4*16 bits + 40 bits (10bits error code for each 16bits data)*/
 /* Each RDS packet is devided into 4 blocks of 16bits*/
 /* when we receive RDS packet it is devided into 4 * 3Byts tuples, */
 /*2 bytes of information and 1byte of meta data */
-void parse_rds_tupple(void)
+static void parse_rds_tuple(void)
 {
-   int version =0;
-   __u8 byte1, byte2;
-   static __u8 group, spare, blkc_byte1, blkc_byte2, blkb_byte1, blkb_byte2;
-   static __u8 rds_pty;
-   __u32 tmp1;
-   __u32 tmp2;
-   __u8 offset = 0;
+    __u8 byte1, byte2;
+    static __u8 blkc_byte1, blkc_byte2, blkb_byte1, blkb_byte2;
+    __u32 tmp1;
+    __u32 tmp2;
+    __u8 offset = 0, group = 0, rt_AB;
 
-   byte1 = rds_tupple[1];
-   byte2 = rds_tupple[0];
-/*tempbuf[2] has meta data */
-   switch ((rds_tupple[2]& 0x07)) {
-      case 0: /* Block A */
-         break;
+    byte1 = rds_parser.rds_tuple[1];
+    byte2 = rds_parser.rds_tuple[0];
 
-      case 1: /* Block B */
-         if (rds_tupple[2] & (BRCM_RDS_BIT_6 | BRCM_RDS_BIT_7)) {
-            /* invalid tupple */
-            skip_flag = 1; /* skip Block D decode */
-            break;
-        }
-        skip_flag = 0;
-        V4L2_FM_DRV_DBG(V4L2_DBG_RX, "block B - group=%d%c tp=%d pty=%d spare=%d\n",
-        (byte1 >> 4) & 0x0f,
-        ((byte1 >> 3) & 0x01) + 'A',
-        (byte1 >> 2) & 0x01,
-        ((byte1 << 3) & 0x18) | ((byte2 >> 5) & 0x07),
-                byte2 & 0x1f);
-         blkb_byte1 = byte1;
-         blkb_byte2 = byte2;
-         group = (byte1 >> 3) & 0x1f;
-         spare = byte2 & 0x1f;
-         rds_pty = ((byte1 << 3) & 0x18) | ((byte2 >> 5) & 0x07);
-         ms_code = (byte2 >> 3)& 0x1;
-         tp = (byte1 & (1 << 2));
-         break;
+    switch ((rds_parser.rds_tuple[2] & 0x07)) {
+        case V4L2_RDS_BLOCK_A: /* Block A */
+            if (rds_parser.rds_tuple[2] & BRCM_RDS_BIT_7) {
+                break;
+            }
 
-      case 2: /* Block C */
-         if (rds_tupple[2] & (BRCM_RDS_BIT_6 | BRCM_RDS_BIT_7)) {
-            /* invalid tupple */
+            rds_parser.pi_code = (byte1 << 8) | byte2;
             break;
-         }
-         blkc_byte1 = byte1;
-         blkc_byte2 = byte2;
-         break;
 
-      case 3 : /* Block D */
-         if (rds_tupple[2] & (BRCM_RDS_BIT_6 | BRCM_RDS_BIT_7)) {
-            /* invalid tupple */
+        case V4L2_RDS_BLOCK_B: /* Block B */
+            if (rds_parser.rds_tuple[2] & BRCM_RDS_BIT_7) {
+                /* invalid tupple */
+                rds_parser.skip_flag = 1; /* skip Block D decode */
+                break;
+            }
+
+            rds_parser.skip_flag = 0;
+            rds_parser.pty = ((byte1 << 3) & 0x18) | ((byte2 >> 5) & 0x07);
+            rds_parser.tp = (byte1 >> 2) & 0x01;
+
+            blkb_byte1 = byte1;
+            blkb_byte2 = byte2;
+
+            V4L2_FM_DRV_DBG(V4L2_DBG_RX, "Block B - group=%d%c tp=%d",
+            (byte1 >> 4) & 0x0f,
+            ((byte1 >> 3) & 0x01) + 'A',
+            rds_parser.tp);
+
             break;
-         }
-         /* Parsing the PI code, PI code will be present in all the Groups in Block-c*/
-         version = (group & 0x01);
-         if(version) {
-            pi_code_b |= (blkc_byte1 << 8) & 0xFF;
-            pi_code_b |= (blkc_byte2 << 16) & 0xFFFF;
-         }
-         if (skip_flag) {
-            /* group and spare was */
-            break;
-         }
-         switch (group) {
-             /*There are 32 Groups in total but we are only interested in the following Groups*/
-            case 0: /* Group 0A */
-            case 1: /* Group 0B */
-               rds_psn[2*(spare & 0x03)+0] = byte1;
-               rds_psn[2*(spare & 0x03)+1] = byte2;
-               psn_const_flags |= 0x01 << (spare & 0x03);
-               if (psn_const_flags == 0x0F) {
-                  V4L2_FM_DRV_DBG(V4L2_DBG_RX, "PSN: %s, PTY: %s, MS: %s\n",rds_psn,
-                                   pty_str[rds_pty],ms_code?"Music":"Speech");
-                  psn_const_flags = 0x00; // reset
-               }
-               ta = blkb_byte2 & (0x01 << 4);
+
+        case V4L2_RDS_BLOCK_C: /* Block C */
+        case V4L2_RDS_BLOCK_C_ALT: /* Block C' */
+            if (rds_parser.rds_tuple[2] & BRCM_RDS_BIT_7) {
+               /* invalid tuple */
                break;
-            case 4: /* Group 2A */
-               rds_txt[4*(spare & 0x0f)+0] = blkc_byte1;
-               rds_txt[4*(spare & 0x0f)+1] = blkc_byte2;
-               rds_txt[4*(spare & 0x0f)+2] = byte1;
-               rds_txt[4*(spare & 0x0f)+3] = byte2;
-            /* Display radio text once we get 16 characters */
-            /*        if ((spare & 0x0f) == 0x0f)*/
-                if (spare > 16)
-                {
-                    V4L2_FM_DRV_DBG(V4L2_DBG_RX, "Radio Text: %s\n",rds_txt);
-                }
-                break;
-               /* Parsing  CT information*/
-               case 8: /*Group 4A*/
-                 /* b0-b14@day = b0-b7@bc_1 + b1-b7@bc_2 */
-                 tmp1 = (__u32)((blkc_byte1 << 8) | blkc_byte2);
-                 /* b15,b16@day = b0,b1@bb_2 */
-                 tmp2 = (__u32)(blkb_byte2 & 0x03);
-                 current_ct.day = (tmp2 << 15) | (tmp1 >> 1);
-                 tmp1 = (__u32)(blkc_byte2 & 0x01);/* b4@hour = LSB of bc_2 */
-                 tmp2 = (__u32)(byte1 & 0xf0);/* b0-b3@hour = highest 4 bits of bd_1 */
-                 current_ct.hour = (__u8)((tmp1 << 4) | (tmp2 >> 4));
-                 current_ct.minute = ((byte1 & 0x0f) << 2)|((byte2  & 0xc0) >>6);
-                 current_ct.second = (byte2 & 0x20) >> 5;
-                 offset = byte2  & 0x1f;
-                 V4L2_FM_DRV_DBG(V4L2_DBG_RX, "ct day: %d, hour: %d, minute: %d, sec: %d",
-                           current_ct.day, current_ct.hour, current_ct.minute, current_ct.second);
-                 break;
+            }
+
+            blkc_byte1 = byte1;
+            blkc_byte2 = byte2;
+            break;
+
+        case V4L2_RDS_BLOCK_D: /* Block D */
+            /* When Block B is invalid (with skip_flag set),
+             * there is no necessary info for deciding
+             * how to interpret the content of Block D,
+             * and thus having to skip this block as well
+             */
+            if (rds_parser.skip_flag || (rds_parser.rds_tuple[2] & BRCM_RDS_BIT_7)) {
+               /* invalid/not interpretable tuple */
+               rds_parser.skip_flag = 0;
+               break;
+            }
+
+            /* Parsing the PI code, PI code will be present in all the Groups in Block-c*/
+            group = (blkb_byte1 >> 3) & 0x1f;
+            if (group & 0x01) {
+                /* This is a message B, and there is a pi_code stored in Block C as well */
+                rds_parser.pi_code = (blkc_byte1 << 8) | blkc_byte2;
+            }
+
+            /*
+             * Event flags associated with field in previous blocks are
+             * not marked until a valid block D is received
+             */
+            rds_parser.events |=
+                RDS_EVENT_PI_CODE | RDS_EVENT_TP | RDS_EVENT_PTY;
+            switch (group) {
+                /*There are 32 Groups in total but we are only interested in the following Groups*/
+                case 0: /* Group 0A */
+                case 1: /* Group 0B */
+                    rds_parser.ms_code = (blkb_byte2 >> 3) & 0x01;
+                    rds_parser.ta = (blkb_byte2 >> 4) & 0x01;
+
+                    rds_parser.events |= RDS_EVENT_TA | RDS_EVENT_MS;
+                    offset = blkb_byte2 & 0x03;
+
+                    rds_parser.ps[2*offset+0] = byte1;
+                    rds_parser.ps[2*offset+1] = byte2;
+
+                    /*
+                     * Signalling the programm/station name is ready for retrieval every time a full update is completed
+                     */
+
+                    rds_parser.ps_markers |= 0x1 << offset;
+
+                    if (rds_parser.ps_markers == 0x0F) {
+                        rds_parser.ps_markers = 0;
+                        rds_parser.events |= RDS_EVENT_PS;
+
+                        V4L2_FM_DRV_DBG(V4L2_DBG_RX, "PSN: %s, PTY: %s, MS: %s\n",
+                        rds_parser.ps,
+                        (rds_parser.pty < sizeof(pty_str)/sizeof(pty_str[0]))
+                        ? pty_str[rds_parser.pty] : "unknown",
+                        rds_parser.ms_code?"Music":"Speech");
+                    }
+                    break;
+                case 4: /* Group 2A */
+                case 5: /* Group 2B */
+                    offset = blkb_byte2 & 0x0F;
+                    rt_AB = (blkb_byte2 >> 4) & 0x01;
+                    if (rt_AB != rds_parser.rt_AB) {
+                        memset(rds_parser.rt, 0, sizeof(rds_parser.rt));
+                        rds_parser.rt_markers = 0;
+                        rds_parser.rt_checkers = 0;
+                        rds_parser.rt_AB = rt_AB;
+                    }
+
+                    if (group & 0x01) {
+                        rds_parser.rt[2*offset+0] = byte1;
+                        rds_parser.rt[2*offset+1] = byte2;
+                    }
+                    else {
+                        rds_parser.rt[4*offset+0] = blkc_byte1;
+                        rds_parser.rt[4*offset+1] = blkc_byte2;
+                        rds_parser.rt[4*offset+2] = byte1;
+                        rds_parser.rt[4*offset+3] = byte2;
+                    }
+
+                    /*
+                     * Signalling the radio text is ready for retrieval every time a full update is completed
+                     */
+                    tmp1 = 0x1 << offset;
+                    rds_parser.rt_markers |= tmp1;
+                    if (tmp1 > rds_parser.rt_checkers) {
+                        rds_parser.rt_checkers = (tmp1 << 1) - 1;
+                    }
+
+                    if (rds_parser.rt_markers == rds_parser.rt_checkers)
+                    {
+                        rds_parser.rt_markers = 0;
+                        rds_parser.events |= RDS_EVENT_RT;
+
+                        V4L2_FM_DRV_DBG(V4L2_DBG_RX, "Radio Text: %s", rds_parser.rt);
+                    }
+                    break;
+                /* Parsing  CT information*/
+                case 8: /*Group 4A*/
+                    /* b14-b0@day = (b7-b0@bc_1 << 7) | b7-b1@bc_2 */
+                    tmp1 = (__u32)((blkc_byte1 << 8) | blkc_byte2);
+                    /* b16,b15@day = b1,b0@bb_2 */
+                    tmp2 = (__u32)(blkb_byte2 & 0x03);
+                    rds_parser.ct.day = (tmp2 << 15) | (tmp1 >> 1);
+                    tmp1 = (__u32)(blkc_byte2 & 0x01);/* b4@hour = b0@bc_2 */
+                    tmp2 = (__u32)(byte1 & 0xf0);/* b3-b0@hour = b7-b4@bd_1 */
+                    rds_parser.ct.hour = (__u8)((tmp1 << 4) | (tmp2 >> 4));
+                    /* b5-b0@minute = (b3-b0@bd_1 << 2) | b7-b6@bd_2 */
+                    rds_parser.ct.minute = ((byte1 & 0x0f) << 2)|((byte2 >> 6)  & 0x03);
+                    /* half hour offset sign bit = b5@bd_2 */
+                    rds_parser.ct.hoffset_sign = (byte2 >> 5) & 0x01;
+                    /* half hour offset magnitude  = b4-b0@bd_2 */
+                    rds_parser.ct.hoffset_magnitude = byte2 & 0x1F;
+                    rds_parser.events |= RDS_EVENT_CT;
+                    V4L2_FM_DRV_DBG(V4L2_DBG_RX, "ct day: %u, hour: %hhu, minute: %hhu, hoffset_sign: %hhu, hoffset_magnitude: %hhu",
+                           rds_parser.ct.day,
+                           rds_parser.ct.hour,
+                           rds_parser.ct.minute,
+                           rds_parser.ct.hoffset_sign,
+                           rds_parser.ct.hoffset_magnitude);
+                    break;
                 case 15:
-                   ta = blkb_byte2 & (0x01 << 4);
-                }
-                break;
-         default:
-              V4L2_FM_DRV_DBG(V4L2_DBG_RX, "unknown block [%d]\n",rds_tupple[2]);
-         }
+                    rds_parser.ta = (blkb_byte2 >> 4) & 0x01;
+                    rds_parser.events |= RDS_EVENT_TA;
+                    break;
+            }
+            break;
+        default:
+            V4L2_FM_DRV_DBG(V4L2_DBG_RX, "Unhandled/Unknown block [%hhu]\n",rds_parser.rds_tuple[2]&0x07);
+            break;
+    }
 }
 
 /* Helper function to parse the RDS data
 * in FM_REG_FM_RDS_DATA (0x80).
 * Called locally by fmdrv_main.c
 */
-int parse_rds_data(struct fmdrv_ops *fmdev)
+static int parse_rds_data(struct fmdrv_ops *fmdev, struct sk_buff *skb)
 {
-    unsigned long flags;
+    //unsigned long flags;
     unsigned char *rds_data;
     unsigned char type, block_index;
     tBRCM_RDS_QUALITY qlty_index;
-    int ret, response_len, index=0;
-    struct sk_buff *skb;
+    //int ret = 0, response_len, index=0;
+    int response_len, index=0;
+    void *err_ptr;
+    bool rds_buffer_full = false;
 
-    V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(rds)");
-
-    spin_lock_irqsave(&fmdev->resp_skb_lock, flags);
-    skb = fmdev->response_skb;
-    fmdev->response_skb = NULL;
-    spin_unlock_irqrestore(&fmdev->resp_skb_lock, flags);
-    skb_pull(skb, (sizeof(struct fm_event_msg_hdr) + sizeof(struct fm_cmd_complete_hdr)));
+    skb_pull(skb, FM_EVT_MSG_HDR_SIZE + FM_CMD_COMPLETE_HDR_SIZE);
     rds_data = skb->data;
     response_len = skb->len;
 
     V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(rds) RDS length : %d", response_len);
 
     /* Read RDS data */
-    spin_lock_irqsave(&fmdev->rds_cbuff_lock, flags);
     while (response_len > 0)
     {
-        /* Fill RDS buffer as per V4L2 specification.
-     * Store control byte
-     */
+        /* Filling RDS circular buffer with data
+         * in the format described in V4L2 specification
+         */
 
         type = (rds_data[0] & BRCM_RDS_GRP_TYPE_MASK);
         block_index = (type >> 4);
-        if (block_index < V4L2_RDS_BLOCK_A|| block_index >= V4L2_RDS_BLOCK_C_ALT)
+        if (block_index < V4L2_RDS_BLOCK_A || block_index > V4L2_RDS_BLOCK_C_ALT)
         {
-            V4L2_FM_DRV_ERR("(rds) Block sequence mismatch\n");
+            V4L2_FM_DRV_ERR("(rds) Unrecognised block index: 0x%x", block_index);
             block_index = V4L2_RDS_BLOCK_INVALID;
         }
 
         qlty_index = (tBRCM_RDS_QUALITY)((rds_data[0] & BRCM_RDS_GRP_QLTY_MASK) >> 2);
 
-        rds_tupple[2] = (block_index & V4L2_RDS_BLOCK_MSK);    /* Offset name */
-        rds_tupple[2] |= ((block_index & V4L2_RDS_BLOCK_MSK) << 3);  /* Reserved offset */
+        rds_parser.rds_tuple[2] = (block_index & V4L2_RDS_BLOCK_MSK);    /* Offset name */
+        rds_parser.rds_tuple[2] |= (block_index & V4L2_RDS_BLOCK_MSK) << 3;  /* Received offset */
+
 
         switch(qlty_index)
         {
             case BRCM_RDS_NO_ERR:
-                /* Set bits 7 and 8 to 0 to indicate no error / correction*/
-              //  V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(rds) qlty : BRCM_RDS_NO_ERR");
+                // V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(rds) qlty : BRCM_RDS_NO_ERR");
                 break;
             case BRCM_RDS_2BIT_ERR:
             case BRCM_RDS_3BIT_ERR:
                 V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(rds) qlty : %s", ((qlty_index==BRCM_RDS_2BIT_ERR)? \
                     "BRCM_RDS_2BIT_ERR":"BRCM_RDS_3BIT_ERR"));
-                /* Set bit 7 to 1 and bit 8 to 0 indicate no error
+                /* Set bit 6 to 1 and bit 7 to 0 indicate no error
                     but correction made*/
-                rds_tupple[2] |= (BRCM_RDS_BIT_6);
-                rds_tupple[2] &= ~(BRCM_RDS_BIT_7);
+                rds_parser.rds_tuple[2] |= (BRCM_RDS_BIT_6);
+                rds_parser.rds_tuple[2] &= ~(BRCM_RDS_BIT_7);
                 break;
 
             case BRCM_RDS_UNRECOVER:
                 V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(rds) qlty : BRCM_RDS_UNRECOVER for data [ 0x%x 0x%x 0x%x]",\
                     rds_data[0], rds_data[1], rds_data[2]);
-                /* Set bit 7 to 0 and bit 8 to 1 indicate error */
-                rds_tupple[2] |= (BRCM_RDS_BIT_7);
-                rds_tupple[2] &= ~(BRCM_RDS_BIT_6);
+                /* Set bit 6 to 0 and bit 7 to 1 indicate error */
+                rds_parser.rds_tuple[2] &= ~(BRCM_RDS_BIT_6);
+                rds_parser.rds_tuple[2] |= (BRCM_RDS_BIT_7);
                 break;
              default :
                 V4L2_FM_DRV_ERR("(rds) Unknown quality code");
-                rds_tupple[2] |= (BRCM_RDS_BIT_7);
-                rds_tupple[2] &= ~(BRCM_RDS_BIT_6);
-
+                rds_parser.rds_tuple[2] &= ~(BRCM_RDS_BIT_6);
+                rds_parser.rds_tuple[2] |= (BRCM_RDS_BIT_7);
+                break;
         }
 
         /* Store data byte. Swap bytes*/
-        rds_tupple[0] = rds_data[2]; /* LSB of V4L2 spec block */
-        rds_tupple[1] = rds_data[1]; /* MSB of V4L2 spec block */
-        parse_rds_tupple();
-        memcpy(&fmdev->rx.rds.cbuffer[fmdev->rx.rds.wr_index], &rds_tupple,
-               FM_RDS_TUPLE_LENGTH);
-        fmdev->rx.rds.wr_index =
-            (fmdev->rx.rds.wr_index +
-             FM_RDS_TUPLE_LENGTH) % fmdev->rx.rds.buf_size;
+        rds_parser.rds_tuple[0] = rds_data[2]; /* LSB of V4L2 spec block */
+        rds_parser.rds_tuple[1] = rds_data[1]; /* MSB of V4L2 spec block */
 
-        /* Check for overflow & start over */
-        if (fmdev->rx.rds.wr_index == fmdev->rx.rds.rd_index) {
-            pr_err("RDS buffer overflow");
-            fmdev->rx.rds.wr_index = 0;
-            fmdev->rx.rds.rd_index = 0;
-            break;
+        spin_lock(&fmdev->rx.rds.cbuff_lock);
+        memcpy(&fmdev->rx.rds.cbuffer[fmdev->rx.rds.wr_index], rds_parser.rds_tuple, FM_RDS_TUPLE_LENGTH);
+        fmdev->rx.rds.wr_index =
+            (fmdev->rx.rds.wr_index + FM_RDS_TUPLE_LENGTH) % fmdev->rx.rds.buf_size;
+
+        /* Checking for overflow */
+        if ((rds_buffer_full = (fmdev->rx.rds.wr_index == fmdev->rx.rds.rd_index))) {
+            fmdev->rx.rds.rd_index =
+                (fmdev->rx.rds.rd_index + FM_RDS_TUPLE_LENGTH) % fmdev->rx.rds.buf_size;
         }
+        spin_unlock(&fmdev->rx.rds.cbuff_lock);
+
+        if (rds_buffer_full)
+            V4L2_FM_DRV_DBG(V4L2_DBG_RX, "RDS cache buffer full; throwing away the oddest cache");
+
+        /* Also parsing raw rds data internally
+         * to provide easy access of it through ioctl commands
+         */
+        parse_rds_tuple();
 
         /*Check for end of RDS tuple */
         if ((rds_data + FM_RDS_TUPLE_LENGTH)[FM_RDS_TUPLE_BYTE1] == FM_RDS_END_TUPLE_1ST_BYTE &&
@@ -982,7 +988,6 @@ int parse_rds_data(struct fmdrv_ops *fmdev)
         rds_data += FM_RDS_TUPLE_LENGTH;
         index += FM_RDS_TUPLE_LENGTH;
     }
-    spin_unlock_irqrestore(&fmdev->rds_cbuff_lock, flags);
 
      /* Set Tuner RDS capability bit as RDS data has been detected */
     fmdev->device_info.rxsubchans |= V4L2_TUNER_SUB_RDS;
@@ -991,14 +996,14 @@ int parse_rds_data(struct fmdrv_ops *fmdev)
     if (fmdev->rx.rds.wr_index != fmdev->rx.rds.rd_index)
         wake_up_interruptible(&fmdev->rx.rds.read_queue);
 
-    V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(fmdrv) Now reset the mask");
-
+    /*
+     * Calling fm_rx_set_mask with fm_rds_mask to
+     * raise the I2C_MASK_RDS_FIFO_WLINE_BIT again
+     * and continue the rds data notification
+     */
     fmdev->rx.fm_rds_mask |= I2C_MASK_RDS_FIFO_WLINE_BIT;
+    fm_rx_set_mask(fmdev, fmdev->rx.fm_rds_mask);
 
-    ret = __fm_send_cmd(fmdev, FM_REG_FM_RDS_MSK, &fmdev->rx.fm_rds_mask,
-                            2, REG_WR, NULL);
-
-    V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(fmdrv) Write to FM_REG_FM_RDS_MSK done : %d", ret);
 
     kfree(skb);
     return 0;
@@ -1008,45 +1013,70 @@ int parse_rds_data(struct fmdrv_ops *fmdev)
  * Read the FM_REG_FM_RDS_FLAG by sending a read command.
  * Called locally by fmdrv_main.c
  */
-void send_read_intrp_cmd(struct fmdrv_ops *fmdev)
+static void send_read_intrp_cmd(struct fmdrv_ops *fmdev)
 {
     unsigned char read_length;
-    int ret;
+    void *err_ptr;
 
+    /* Asynchronous fm_rds interrupt events retrieval */
     read_length = FM_READ_2_BYTE_DATA;
-    ret = __fm_send_cmd(fmdev, FM_REG_FM_RDS_FLAG, &read_length,
-                            sizeof(read_length), REG_RD, NULL);
-    if(ret < 0)
+    err_ptr = __fm_send_cmd(fmdev, FM_REG_FM_RDS_FLAG, &read_length,
+                            sizeof(read_length), REG_RD,
+                            false /* waiting_for_resp */);
+    if(IS_ERR(err_ptr))
     {
         pr_err("(fmdrv) Error reading FM_REG_FM_RDS_FLAG");
     }
     V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv) Sent read to Interrupt flag FM_REG_FM_RDS_FLAG");
 }
 
-/* Initiate a read to RDS register. Called locally by fmdrv_main.c */
-int read_rds_data(struct fmdrv_ops *fmdev)
+/* Initiate a read from RDS register. Called locally by fmdrv_main.c */
+static int read_rds_data(struct fmdrv_ops *fmdev)
 {
     unsigned char payload;
-    int ret;
+    void *err_ptr;
 
-    payload = FM_RDS_FIFO_MAX;
+    //payload = FM_RDS_FIFO_MAX;
+    payload = FM_RDS_UPD_TUPLE*3;
 
     V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(fmdrv) Going to read RDS data from FM_REG_RDS_DATA!!");
 
-    ret = __fm_send_cmd(fmdev, FM_REG_RDS_DATA, &payload, 1, REG_RD, NULL);
-    return 0;
+    /* Asynchronous rds data retrieval */
+    err_ptr = __fm_send_cmd(fmdev, FM_REG_RDS_DATA, &payload, 1, REG_RD, false /* waiting_for_resp */);
+    if (IS_ERR(err_ptr))
+        return PTR_ERR(err_ptr);
+    else
+        return 0;
+}
+
+/*
+* Returns availability of RDS data in internel buffer.
+* If data is present in RDS buffer, return 0. Else, return -EAGAIN.
+* The V4L2 driver's poll() uses this method to determine RDS data availability.
+*/
+int fmc_is_rds_data_available(struct fmdrv_ops *fmdev, struct file *file, struct poll_table_struct *pts)
+{
+    poll_wait(file, &fmdev->rx.rds.read_queue, pts);
+
+    if (fmdev->rx.rds.rd_index != fmdev->rx.rds.wr_index) {
+        V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(fmdrv) Poll success. RDS data is "\
+            "available in buffer");
+        return 0;
+    }
+    V4L2_FM_DRV_ERR("(fmdev) RDS Buffer is empty");
+    return -EAGAIN;
 }
 
 /*
  * Function to copy RDS data from the FM ring buffer
  * to the userspace buffer.
  */
-int fmc_transfer_rds_from_cbuff(struct fmdrv_ops *fmdev, struct file *file,
+ssize_t fmc_transfer_rds_from_cbuff(struct fmdrv_ops *fmdev, struct file *file,
                     char __user * buf, size_t count)
 {
     unsigned int block_count;
-    unsigned long flags;
-    int ret;
+    //unsigned long flags;
+    ssize_t ret;
 
     /* Block if no new data available */
     if (fmdev->rx.rds.wr_index == fmdev->rx.rds.rd_index) {
@@ -1065,32 +1095,39 @@ int fmc_transfer_rds_from_cbuff(struct fmdrv_ops *fmdev, struct file *file,
     block_count = 0;
     ret = 0;
 
-    spin_lock_irqsave(&fmdev->rds_cbuff_lock, flags);
 
     /* Copy RDS blocks from the internal buffer and to user buffer */
     while (block_count < count) {
-        if (fmdev->rx.rds.wr_index == fmdev->rx.rds.rd_index)
+        bool is_empty = false;
+        unsigned char tmp_buffer[FM_RDS_BLOCK_SIZE];
+
+        spin_lock(&fmdev->rx.rds.cbuff_lock);
+        if (!(is_empty = (fmdev->rx.rds.wr_index == fmdev->rx.rds.rd_index))) {
+            memcpy(tmp_buffer,
+                    fmdev->rx.rds.cbuffer+fmdev->rx.rds.rd_index,
+                    FM_RDS_BLOCK_SIZE);
+            /* Increment and wrap the read pointer */
+            fmdev->rx.rds.rd_index = (fmdev->rx.rds.rd_index + FM_RDS_BLOCK_SIZE) % fmdev->rx.rds.buf_size;
+        }
+        spin_unlock(&fmdev->rx.rds.cbuff_lock);
+
+        if (is_empty)
             break;
 
-        /* Always transfer complete RDS blocks */
-        if (copy_to_user
-            (buf, &fmdev->rx.rds.cbuffer[fmdev->rx.rds.rd_index],
-             FM_RDS_BLOCK_SIZE))
+        /*
+         * Always transfer complete RDS blocks;
+         * note that copy_to_user() might sleep,
+         * so it can not be called while holding a spin_lock
+         */
+        if (copy_to_user(buf, tmp_buffer, FM_RDS_BLOCK_SIZE))
             break;
 
-        /* Increment and wrap the read pointer */
-        fmdev->rx.rds.rd_index += FM_RDS_BLOCK_SIZE;
-
-        /* Wrap read pointer */
-        if (fmdev->rx.rds.rd_index >= fmdev->rx.rds.buf_size)
-            fmdev->rx.rds.rd_index = 0;
 
         /* Increment counters */
         block_count++;
         buf += FM_RDS_BLOCK_SIZE;
         ret += FM_RDS_BLOCK_SIZE;
     }
-    spin_unlock_irqrestore(&fmdev->rds_cbuff_lock, flags);
 
     V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(rds) %s Done copying %d", __func__, ret);
 
@@ -1132,8 +1169,9 @@ int fmc_get_frequency(struct fmdrv_ops *fmdev, unsigned int *cur_tuned_frq)
             break;
 
         case FM_MODE_TX:
-        /* Currently FM TX is not supported */
-        V4L2_FM_DRV_ERR("Currently FM TX is not supported");
+            /* Currently FM TX is not supported */
+            V4L2_FM_DRV_ERR("Currently FM TX is not supported");
+            /* Deliberately falling through */
 
         default:
             ret = -EINVAL;
@@ -1149,33 +1187,38 @@ int fmc_seek_station(struct fmdrv_ops *fmdev, unsigned char direction_upward,
 }
 
 /* Returns current band index (0-Europe/US; 1-Japan) */
-int fmc_get_region(struct fmdrv_ops *fmdev, unsigned char *region)
+int fmc_get_band(struct fmdrv_ops *fmdev, unsigned char *band)
 {
-    *region = fmdev->rx.curr_region;
+    *band = fmdev->rx.curr_band;
     return 0;
 }
 
 /* Set the world region */
-int fmc_set_region(struct fmdrv_ops *fmdev, unsigned char region_to_set)
+int fmc_set_band(struct fmdrv_ops *fmdev, unsigned char region_to_set)
 {
     int ret;
 
     switch (fmdev->curr_fmmode) {
         case FM_MODE_RX:
-            if (region_to_set == fmdev->rx.curr_region)
-            {
+            if (region_to_set == fmdev->rx.curr_band) {
                 V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv): Already region is set(%d)", region_to_set);
-                return 0;
+                ret = 0;
+            } else if (region_to_set < FM_BAND_EUROPE
+                        || region_to_set > FM_BAND_MAX) {
+                ret = -EINVAL;
+            } else {
+                ret = fm_rx_set_band(fmdev, region_to_set);
             }
-            ret = fm_rx_set_region(fmdev, region_to_set);
             break;
 
         case FM_MODE_TX:
-        /* Currently FM TX is not supported */
-        V4L2_FM_DRV_ERR("Currently FM TX is not supported");
+            /* Currently FM TX is not supported */
+            V4L2_FM_DRV_ERR("Currently FM TX is not supported");
+            /* Deliberately falling through */
 
         default:
             ret = -EINVAL;
+            break;
     }
     return ret;
 }
@@ -1187,12 +1230,13 @@ int fmc_set_audio_mode(struct fmdrv_ops *fmdev, unsigned char audio_mode)
 
     switch (fmdev->curr_fmmode) {
         case FM_MODE_RX:
-            ret = fm_rx_set_audio_mode(fmdev, audio_mode);
+            ret = fm_rx_set_audio_mode(fmdev, audio_mode, fmdev->rx.curr_band);
             break;
 
         case FM_MODE_TX:
             /* Currently FM TX is not supported */
             V4L2_FM_DRV_ERR("Currently FM TX is not supported");
+            /* Deliberately falling through */
 
         default:
             ret = -EINVAL;
@@ -1213,6 +1257,7 @@ int fmc_get_audio_mode(struct fmdrv_ops *fmdev, unsigned char *audio_mode)
         case FM_MODE_TX:
             /* Currently FM TX is not supported */
             V4L2_FM_DRV_ERR("Currently FM TX is not supported");
+            /* Deliberately falling through */
 
         default:
             ret = -EINVAL;
@@ -1233,6 +1278,7 @@ int fmc_set_scan_step(struct fmdrv_ops *fmdev, unsigned char scan_step)
         case FM_MODE_TX:
             /* Currently FM TX is not supported */
             V4L2_FM_DRV_ERR("Currently FM TX is not supported");
+            /* Deliberately falling through */
 
         default:
             ret = -EINVAL;
@@ -1241,40 +1287,24 @@ int fmc_set_scan_step(struct fmdrv_ops *fmdev, unsigned char scan_step)
 }
 
 /*
-* Resets RDS cache parameters
-*/
-void fmc_reset_rds_cache(struct fmdrv_ops *fmdev)
-{
-    fmdev->rx.rds.rds_flag = FM_RDS_DISABLE;
-    fmdev->rx.rds.wr_index = 0;
-    fmdev->rx.rds.rd_index = 0;
-    fmdev->device_info.rxsubchans &= ~V4L2_TUNER_SUB_RDS;
-}
-
-/*
  * Turn FM ON by sending FM_REG_RDS_SYS commmand
  */
-int fmc_turn_fm_on (struct fmdrv_ops *fmdev, unsigned char rds_flag)
+int fmc_turn_fm_on (struct fmdrv_ops *fmdev, bool rds_enabled)
 {
     int ret;
     unsigned char payload;
 
-    if (rds_flag != FM_RDS_ENABLE && rds_flag != FM_RDS_DISABLE) {
-        pr_err("(fmdrv): Invalid rds option");
-        return -EINVAL;
-    }
-    if (rds_flag == FM_RDS_ENABLE)
+    if (rds_enabled)
         payload = (FM_ON | FM_RDS_ON);
     else
         payload = FM_ON;
 
     ret = fmc_send_cmd(fmdev, FM_REG_RDS_SYS, &payload, sizeof(payload),
-            REG_WR, &fmdev->maintask_completion, NULL, NULL);
+            REG_WR, NULL, NULL);
     FM_CHECK_SEND_CMD_STATUS(ret);
 
     V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv): FM_REG_RDS_SYS write done");
 
-    fmdev->rx.rds.rds_flag = rds_flag;
     return ret;
 }
 
@@ -1302,7 +1332,7 @@ int fmc_turn_fm_off(struct fmdrv_ops *fmdev)
     payload = FM_OFF;
 
     ret = fmc_send_cmd(fmdev, FM_REG_RDS_SYS, &payload, sizeof(payload),
-            REG_WR, &fmdev->maintask_completion, NULL, NULL);
+            REG_WR, NULL, NULL);
     FM_CHECK_SEND_CMD_STATUS(ret);
 
     return ret;
@@ -1332,10 +1362,10 @@ int fmc_set_mode(struct fmdrv_ops *fmdev, unsigned char fm_mode)
 /*
  * Turn on FM, and other initialization to enable FM
  */
-int fmc_enable (struct fmdrv_ops *fmdev, unsigned char opt)
+int fmc_enable (struct fmdrv_ops *fmdev, unsigned char fm_band)
 {
     int ret;
-    unsigned char rds_en_dis, rdbs_en_dis;
+    bool rds_enabled = false;
 
     unsigned short aud_ctrl;
     unsigned char read_length;
@@ -1350,32 +1380,26 @@ int fmc_enable (struct fmdrv_ops *fmdev, unsigned char opt)
 
     fmc_set_mode (fmdev, FM_MODE_RX);
 
-    /* turn FM ON */
-    rds_en_dis = (opt & (FM_RDS_BIT | FM_RBDS_BIT)) ?
-                            FM_RDS_ENABLE : FM_RDS_DISABLE;
 
-    ret = fmc_turn_fm_on (fmdev, rds_en_dis);
+    /* turn FM ON */
+    rds_enabled = (band_configs[fm_band].rds_support & (FM_RDS_BIT | FM_RBDS_BIT));
+
+    ret = fmc_turn_fm_on(fmdev, rds_enabled);
 
     if (ret < 0)
     {
         pr_err ("(fmdrv): FM turn on failed");
         return ret;
     }
-    fmdev->rx.fm_func_mask = opt;
     /* wait for 300 ms before sending any more commands */
     mdelay (V4L2_FM_ENABLE_DELAY);
-
-    /* wrire rds control */
-    rdbs_en_dis = (opt & FM_RBDS_BIT) ?
-            FM_RDBS_ENABLE : FM_RDBS_DISABLE;
-    ret = fm_rx_set_rds_system (fmdev, rdbs_en_dis);
 
     if (ret < 0)
     {
         V4L2_FM_DRV_ERR("(fmdrv): set rds mode failed");
         return ret;
     }
-    ret = fm_rx_set_region( fmdev,(opt & FM_REGION_MASK));
+    ret = fm_rx_set_band(fmdev, fm_band);
 
     if (ret < 0)
     {
@@ -1384,45 +1408,26 @@ int fmc_enable (struct fmdrv_ops *fmdev, unsigned char opt)
     }
     /* Read PCM Route settings */
     read_length = FM_READ_1_BYTE_DATA;
-    ret = fmc_send_cmd(fmdev, FM_REG_PCM_ROUTE, &read_length, sizeof(read_length), REG_RD,
-                    &fmdev->maintask_completion, &resp_buf, &resp_len);
+    ret = fmc_send_cmd(fmdev, FM_REG_PCM_ROUTE, &read_length, sizeof(read_length), REG_RD, &resp_buf, &resp_len);
     FM_CHECK_SEND_CMD_STATUS(ret);
     fmdev->rx.pcm_reg = resp_buf[0];
     V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv): pcm_reg value %d", fmdev->rx.pcm_reg);
 
-    /* fm enable with mute state. added FM_MANUAL_MUTE*/
-    aud_ctrl = (unsigned short)(FM_AUDIO_DAC_ON | \
-                    FM_RF_MUTE | FM_Z_MUTE_LEFT_OFF | FM_Z_MUTE_RITE_OFF | \
-                    fmdev->rx.region.deemphasis);
+    /* FM is enabled in the muted state by setting the bit FM_MANUAL_MUTE;
+     * being initially muted can avoid possible burst noise at start
+     */
+    aud_ctrl = (unsigned short)(
+                    FM_AUDIO_DAC_ON
+                    | FM_RF_MUTE | FM_Z_MUTE_LEFT_OFF | FM_Z_MUTE_RITE_OFF
+                    | FM_MANUAL_MUTE
+                    | fmdev->rx.band_config.deemphasis);
 
     ret = fm_rx_set_audio_ctrl(fmdev, aud_ctrl);
 
     fmdev->rx.curr_rssi_threshold = DEF_V4L2_FM_SIGNAL_STRENGTH;
 
-    /* Set world region */
-    V4L2_FM_DRV_DBG(V4L2_DBG_TX,"(fmdrv): FM Set world region option : %d", DEF_V4L2_FM_WORLD_REGION);
-    ret = fmc_set_region(fmdev, DEF_V4L2_FM_WORLD_REGION);
-    if (ret < 0) {
-        V4L2_FM_DRV_ERR("(fmdrv): Unable to set World region");
-        return ret;
-    }
-    fmdev->rx.curr_region = DEF_V4L2_FM_WORLD_REGION;
-
-    /* Set Scan Step */
-#if(defined(DEF_V4L2_FM_WORLD_REGION) && DEF_V4L2_FM_WORLD_REGION == FM_REGION_NA)
-    fmdev->rx.sch_step = FM_STEP_200KHZ;
-#else
-    fmdev->rx.sch_step = FM_STEP_100KHZ;
-#endif
-    V4L2_FM_DRV_DBG(V4L2_DBG_TX,"(fmdrv): FM Set Scan Step : 0x%x", fmdev->rx.sch_step);
-    ret = fmc_set_scan_step(fmdev, fmdev->rx.sch_step);
-    if (ret < 0) {
-        V4L2_FM_DRV_ERR("(fmdrv): Unable to set scan step");
-        return ret;
-    }
-
     /* Enable RDS */
-    fm_rx_enable_rds(fmdev);
+    fm_rx_enable_rds(fmdev, rds_enabled);
 
     return ret;
 }
@@ -1444,29 +1449,146 @@ int fmc_get_mode(struct fmdrv_ops *fmdev, unsigned char *fmmode)
     return 0;
 }
 
+static __u32 fm_extract_sync_id(struct sk_buff *skb)
+{
+    __u32 sync_id = 0, len_expected = 1;
+
+    if (skb->len < len_expected)
+        return sync_id;
+
+    switch (skb->data[0]) {
+        case HCI_COMMAND: {
+            len_expected += sizeof(struct hci_command_hdr);
+            if (skb->len < len_expected)
+                break;
+
+            struct hci_command_hdr *cmd_hdr = (struct hci_command_hdr *)(skb->data+1);
+            __u16 opcode = __le16_to_cpu(cmd_hdr->opcode);
+            switch (opcode) {
+                case hci_opcode_pack(HCI_GRP_VENDOR_SPECIFIC, VSC_HCI_WRITE_PCM_PINS_OCF):
+                    sync_id = opcode << 8;
+                    break;
+                case hci_opcode_pack(HCI_GRP_VENDOR_SPECIFIC, FM_2048_OP_CODE): {
+                    len_expected = sizeof(struct fm_cmd_msg_hdr);
+                    if (skb->len < len_expected)
+                        break;
+
+                    struct fm_cmd_msg_hdr *fm_cmd_hdr = (struct fm_cmd_msg_hdr *)skb->data;
+                    sync_id = opcode << 8 | fm_cmd_hdr->fm_opcode;
+                    break;
+                }
+                default:
+                    break;
+            }
+
+            break;
+        }
+        case FM_PKT_LOGICAL_CHAN_NUMBER: {
+            len_expected = sizeof(struct fm_event_msg_hdr);
+            if (skb->len < len_expected)
+                break;
+
+            struct fm_event_msg_hdr * fm_evt_hdr = (struct fm_event_msg_hdr *)skb->data;
+            if (fm_evt_hdr->event_id == HCI_EV_CMD_COMPLETE) {
+                len_expected += sizeof(struct hci_ev_cmd_complete);
+                if (skb->len < len_expected)
+                    break;
+
+                struct hci_ev_cmd_complete *cmd_complete_hdr = (struct hci_ev_cmd_complete *)(fm_evt_hdr+1);
+                __u16 opcode = __le16_to_cpu(cmd_complete_hdr->opcode);
+
+                switch (opcode) {
+
+                    case hci_opcode_pack(HCI_GRP_VENDOR_SPECIFIC, VSC_HCI_WRITE_PCM_PINS_OCF):
+                        sync_id = opcode << 8;
+                        break;
+                    case hci_opcode_pack(HCI_GRP_VENDOR_SPECIFIC, FM_2048_OP_CODE): {
+                        len_expected += sizeof(struct fm_cmd_complete_hdr) - sizeof(struct hci_ev_cmd_complete);
+                        if (skb->len < len_expected)
+                            break;
+
+                        struct fm_cmd_complete_hdr *fmcmd_complete_hdr = (struct fm_cmd_complete_hdr *)(fm_evt_hdr+1);
+                        sync_id = opcode << 8 | fmcmd_complete_hdr->fm_opcode;
+                        break;
+                    }
+                    default:
+                        break;
+                }
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
+
+    return sync_id;
+}
+
 /*
 * Called by LDisc layer when FM packet is available. The pointer to
 * this function is registered to LDisc during brcm_sh_ldisc_register() call.*/
-static long fm_st_receive(void *arg, struct sk_buff *skb)
+static long fm_st_receive(struct sk_buff *skb)
 {
-    struct fmdrv_ops *fmdev;
-    __u8 pkt_type = 0x08;
-
-    fmdev = (struct fmdrv_ops *)arg;
+    struct fmdrv_ops *fmdev = fm_comp_def.fmdev;
+    struct fm_event_msg_hdr *fm_evt_hdr;
+    bool deferred = false;
 
     if (skb == NULL) {
         V4L2_FM_DRV_ERR("(fmdrv): Invalid SKB received from LDisp");
         return -EFAULT;
     }
-    if (skb->cb[0] != FM_PKT_LOGICAL_CHAN_NUMBER) {
+    if (skb->data[0] != FM_PKT_LOGICAL_CHAN_NUMBER) {
         V4L2_FM_DRV_ERR("(fmdrv): Received SKB (%p) is not FM Channel 8 pkt", skb);
         return -EINVAL;
     }
 
-    memcpy(skb_push(skb, 1), &pkt_type, 1);
-    skb_queue_tail(&fmdev->rx_q, skb);
+    if (skb->len < sizeof(struct fm_event_msg_hdr))
+    {
+        V4L2_FM_DRV_ERR("(fmdrv): skb(%p) has only %d bytes"
+                        "atleast need %lu bytes to decode",
+                                    skb, skb->len,
+                            (unsigned long)sizeof(struct fm_event_msg_hdr));
+        return -EINVAL;
+    }
 
-    queue_work(fmdev->rx_wq,&fmdev->rx_workqueue);
+
+    fm_evt_hdr = (struct fm_event_msg_hdr *)skb->data;
+
+#ifdef FM_DUMP_TXRX_PKT
+    dump_rx_skb_data(skb);
+#endif
+    switch (fm_evt_hdr->event_id) {
+        case HCI_EV_CMD_COMPLETE: {
+            struct hci_ev_cmd_complete *cmd_complete_hdr = (struct hci_ev_cmd_complete *)(fm_evt_hdr+1);
+
+            /* Only handling the opcode specific to FM */
+            if (__le16_to_cpu(cmd_complete_hdr->opcode) == hci_opcode_pack(HCI_GRP_VENDOR_SPECIFIC, FM_2048_OP_CODE)) {
+                deferred = true;
+            }
+
+            break;
+        }
+        /* Vendor specific Event */
+        case BRCM_FM_VS_EVENT: {
+            deferred = true;
+            break;
+        }
+        default: {
+            break;
+        }
+    }
+
+    if (deferred) {
+        spin_lock(&fmdev->rx_q.lock);
+        __skb_queue_tail(&fmdev->rx_q, skb);
+        spin_unlock(&fmdev->rx_q.lock);
+
+        queue_work(fmdev->rx_wq, &fmdev->rx_work);
+    } else {
+        // skipping and removing this skb as being handled successfully
+        kfree_skb(skb);
+    }
 
     return 0;
 }
@@ -1477,7 +1599,7 @@ static long fm_st_receive(void *arg, struct sk_buff *skb)
  */
 int fmc_prepare(struct fmdrv_ops *fmdev)
 {
-    static struct sh_proto_s fm_st_proto;
+    //static struct component_interface comp_interface;
     int ret = 0;
 
     if (test_bit(FM_CORE_READY, &fmdev->flag)) {
@@ -1485,56 +1607,62 @@ int fmc_prepare(struct fmdrv_ops *fmdev)
         return ret;
     }
 
-    memset(&fm_st_proto, 0, sizeof(fm_st_proto));
-    fm_st_proto.type = PROTO_SH_FM;
-    fm_st_proto.recv = fm_st_receive;
-    fm_st_proto.match_packet = NULL;
-    fm_st_proto.write = NULL; /* shared ldisc driver will fill write pointer */
-    fm_st_proto.priv_data = fmdev;
+    fmdev->rx_wq = alloc_ordered_workqueue("fm_drv_rx", 0);
+    if (!fmdev->rx_wq) {
+        V4L2_FM_DRV_ERR("%s(): Unable to create workqueue fm_drv_rx\n", __func__);
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    fmdev->rx.rds.buf_size = default_rds_buf * FM_RDS_TUPLE_LENGTH;
+    /* Allocate memory for RDS ring buffer */
+    fmdev->rx.rds.cbuffer = kzalloc(fmdev->rx.rds.buf_size, GFP_KERNEL);
+    if (!fmdev->rx.rds.cbuffer) {
+        V4L2_FM_DRV_ERR("Can't allocate rds ring buffer");
+        ret = -ENOMEM;
+        goto out;
+    }
+
+
+    fm_comp_def.fmdev = fmdev;
+    fm_comp_def.interface.write = NULL;
 
     /* Register with the shared line discipline */
-    ret = brcm_sh_ldisc_register(&fm_st_proto);
+    ret = brcm_sh_ldisc_register(&fm_comp_def);
     if (ret < 0) {
         pr_err("(fmdrv): brcm_sh_ldisc_register failed %d", ret);
         ret = -EAGAIN;
-        return ret;
+        goto out;
     }
     else {
         V4L2_FM_DRV_DBG(V4L2_DBG_OPEN,"(fmdrv): fmc_prepare: brcm_sh_ldisc_register sucess %d", ret);
     }
 
-    if (fm_st_proto.write != NULL) {
-        g_bcm_write = fm_st_proto.write;
-    }
-    else {
+    if (fm_comp_def.interface.write == NULL) {
         V4L2_FM_DRV_ERR("(fmdrv): Failed to get shared ldisc write func pointer");
-        ret = brcm_sh_ldisc_unregister(PROTO_SH_FM, 1);
+        ret = brcm_sh_ldisc_unregister(COMPONENT_FM, 1);
         if (ret < 0)
             V4L2_FM_DRV_ERR("(fmdrv): brcm_sh_ldisc_unregister failed %d", ret);
-            ret = -EAGAIN;
-            return ret;
+
+        ret = -EAGAIN;
+        goto out;
     }
 
-    spin_lock_init(&fmdev->resp_skb_lock);
-
-    /* Initialize TX queue and TX tasklet */
-    skb_queue_head_init(&fmdev->tx_q);
     /* Initialize RX Queue and RX tasklet */
     skb_queue_head_init(&fmdev->rx_q);
 
-    INIT_WORK(&fmdev->tx_workqueue,fm_send_data_ldisc);
-    INIT_WORK(&fmdev->rx_workqueue,fm_receive_data_ldisc);
+    INIT_WORK(&fmdev->rx_work,fm_receive_data_ldisc);
 
-    atomic_set(&fmdev->tx_cnt, 1);
-    fmdev->response_completion = NULL;
+    init_completion(&fmdev->seektask_completion);
+
 
     /* Do all the broadcom FM hardware specific initialization */
     fmdev->rx.curr_mute_mode = FM_MUTE_OFF;
-    fmdev->rx.rds.rds_flag = FM_RDS_DISABLE;
-    fmdev->rx.curr_region = DEF_V4L2_FM_WORLD_REGION;
-    memcpy(&fmdev->rx.region, &region_configs[fmdev->rx.curr_region],
-                            sizeof(struct region_info));
-    fmdev->rx.curr_freq = fmdev->rx.region.low_bound;
+    //fmdev->rx.rds.rds_flag = FM_RDS_DISABLE;
+    fmdev->rx.curr_band = DEF_V4L2_FM_BAND;
+    memcpy(&fmdev->rx.band_config, band_configs+fmdev->rx.curr_band,
+                            sizeof(struct band_info));
+    fmdev->rx.curr_freq = fmdev->rx.band_config.low_bound;
     fmdev->rx.rds_mode = FM_RDS_SYSTEM_NONE;
     fmdev->rx.curr_snr_threshold = FM_RX_SNR_MAX + 1;
     fmdev->rx.curr_sch_mode = FM_SCAN_NONE;
@@ -1542,7 +1670,6 @@ int fmc_prepare(struct fmdrv_ops *fmdev)
     fmdev->rx.curr_volume = FM_RX_VOLUME_MAX;
     fmdev->rx.audio_mode = FM_AUTO_MODE;
     fmdev->rx.audio_path = FM_AUDIO_NONE;
-    fmdev->rx.sch_step = FM_STEP_NONE;
     fmdev->device_info.capabilities = V4L2_CAP_HW_FREQ_SEEK | V4L2_CAP_TUNER |
                                 V4L2_CAP_RADIO | V4L2_CAP_MODULATOR |
                                 V4L2_CAP_AUDIO | V4L2_CAP_READWRITE | V4L2_CAP_RDS_CAPTURE;
@@ -1551,10 +1678,26 @@ int fmc_prepare(struct fmdrv_ops *fmdev)
     fmdev->device_info.tuner_capability =V4L2_TUNER_CAP_STEREO | V4L2_TUNER_CAP_LOW | V4L2_TUNER_CAP_RDS;
 
     /* RDS initialization */
-    fmc_reset_rds_cache(fmdev);
+    reset_rds(fmdev);
+    spin_lock_init(&fmdev->rx.rds.cbuff_lock);
+
     init_waitqueue_head(&fmdev->rx.rds.read_queue);
 
     set_bit(FM_CORE_READY, &fmdev->flag);
+
+out:
+    if (ret) {
+        if (fmdev->rx_wq) {
+            destroy_workqueue(fmdev->rx_wq);
+            fmdev->rx_wq = NULL;
+        }
+
+        if (fmdev->rx.rds.cbuffer) {
+            kfree(fmdev->rx.rds.cbuffer);
+            fmdev->rx.rds.cbuffer = NULL;
+        }
+    }
+
     return ret;
 }
 
@@ -1571,22 +1714,31 @@ int fmc_release(struct fmdrv_ops *fmdev)
         return 0;
     }
 
-    cancel_work_sync(&fmdev->tx_workqueue);
-    cancel_work_sync(&fmdev->rx_workqueue);
+    if (fmdev->rx_wq) {
+        destroy_workqueue(fmdev->rx_wq);
+        fmdev->rx_wq = NULL;
+    }
 
-    ret = brcm_sh_ldisc_unregister(PROTO_SH_FM, 1);
+    ret = brcm_sh_ldisc_unregister(COMPONENT_FM, 1);
     if (ret < 0)
         V4L2_FM_DRV_ERR("(fmdrv): Failed to de-register FM from HCI LDisc - %d", ret);
     else
         V4L2_FM_DRV_DBG(V4L2_DBG_CLOSE, "(fmdrv): Successfully unregistered from  HCI LDisc");
 
-    /* Sevice pending read */
-    wake_up_interruptible(&fmdev->rx.rds.read_queue);
+    reset_rds(fmdev);
+    if (fmdev->rx.rds.cbuffer) {
+        kfree(fmdev->rx.rds.cbuffer);
+        fmdev->rx.rds.cbuffer = NULL;
+    }
 
-    skb_queue_purge(&fmdev->tx_q);
-    skb_queue_purge(&fmdev->rx_q);
+    /* Waking up pending reads */
+    wake_up_interruptible_all(&fmdev->rx.rds.read_queue);
 
-    fmdev->response_completion = NULL;
+
+    spin_lock(&fmdev->rx_q.lock);
+    __skb_queue_purge(&fmdev->rx_q);
+    spin_unlock(&fmdev->rx_q.lock);
+
     fmdev->rx.curr_freq = 0;
 
     clear_bit(FM_CORE_READY, &fmdev->flag);
@@ -1599,51 +1751,31 @@ int fmc_release(struct fmdrv_ops *fmdev)
 static int __init fm_drv_init(void)
 {
     struct fmdrv_ops *fmdev = NULL;
-    int ret = -ENOMEM;
-/*This is an initialization of CT variable. To perform unit testing*/
-/*Even if you remove this initilization functionality won't be effected*/
-    current_ct.day = 1;
-    current_ct.hour = 2;
-    current_ct.minute = 3;
-    current_ct.second = 4;
+    int ret = 0;
 
     pr_info("(fmdrv): FM driver version %s", FM_DRV_VERSION);
 
     fmdev = kzalloc(sizeof(struct fmdrv_ops), GFP_KERNEL);
-    if (NULL == fmdev) {
+    if (!fmdev) {
         V4L2_FM_DRV_ERR("(fmdrv): Can't allocate operation structure memory");
-        return ret;
-    }
-
-    fmdev->rx.rds.buf_size = default_rds_buf * FM_RDS_TUPLE_LENGTH;
-    /* Allocate memory for RDS ring buffer */
-    fmdev->rx.rds.cbuffer = kzalloc(fmdev->rx.rds.buf_size, GFP_KERNEL);
-    if (fmdev->rx.rds.cbuffer == NULL) {
-        V4L2_FM_DRV_ERR("Can't allocate rds ring buffer");
-        kfree(fmdev);
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto out;
     }
 
     ret = fm_v4l2_init_video_device(fmdev, radio_nr);
     if (ret < 0)
-    {
-        kfree(fmdev);
-        return ret;
-    }
-
-    fmdev->tx_wq= create_workqueue("fm_drv_tx");
-    if (!fmdev->tx_wq) {
-        V4L2_FM_DRV_ERR("%s(): Unable to create workqueue fm_drv_tx\n", __func__);
-        return -ENOMEM;
-    }
-    fmdev->rx_wq= create_workqueue("fm_drv_rx");
-    if (!fmdev->rx_wq) {
-        V4L2_FM_DRV_ERR("%s(): Unable to create workqueue fm_drv_rx\n", __func__);
-        return -ENOMEM;
-    }
+        goto out;
 
     fmdev->curr_fmmode = FM_MODE_OFF;
-    return 0;
+
+out:
+    if (ret < 0) {
+
+        if (fmdev)
+            kfree(fmdev);
+    }
+
+    return ret;
 }
 
 /* Module exit function. Ask FM V4L module to unregister video device */
@@ -1654,9 +1786,7 @@ static void __exit fm_drv_exit(void)
 
     fmdev = fm_v4l2_deinit_video_device();
     if (fmdev != NULL) {
-	destroy_workqueue(fmdev->tx_wq);
-	destroy_workqueue(fmdev->rx_wq);
-	kfree(fmdev);
+        kfree(fmdev);
     }
 }
 

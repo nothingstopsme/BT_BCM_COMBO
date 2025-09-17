@@ -32,12 +32,12 @@
 *
 ************************************************************************************/
 
+#include "fmdrv_config.h"
 #include "fmdrv.h"
 #include "fmdrv_v4l2.h"
 #include "fmdrv_main.h"
 #include "fmdrv_rx.h"
 #include "fm_public.h"
-#include "fmdrv_config.h"
 #include "../include/v4l2_target.h"
 #include "../include/v4l2_logs.h"
 #include <linux/ioctl.h>
@@ -51,26 +51,26 @@
 /************************************************************************************
 **  Constants & Macros
 ************************************************************************************/
-#ifndef V4L2_FM_DEBUG
-#define V4L2_FM_DEBUG TRUE
-#endif
 
-/* The major device number. We can't rely on dynamic
+/* The private ioctl type. We can't rely on dynamic
  * registration any more, because ioctls need to know
  * it.  There is no logic behind chosing 100, it's just a random
  * number*/
-#define MAJOR_NUM 100
-/* Set the message of the device driver */
-#define IOCTL_GET_PI_CODE _IOR(MAJOR_NUM, 0, char *)
-#define IOCTL_GET_TP_CODE _IOR(MAJOR_NUM, 1, void *)
-#define IOCTL_GET_PTY_CODE _IOR(MAJOR_NUM, 2, char *)
-#define IOCTL_GET_TA_CODE _IOR(MAJOR_NUM, 3, char *)
-#define IOCTL_GET_MS_CODE _IOR(MAJOR_NUM, 4, char *)
-#define IOCTL_GET_PS_CODE _IOR(MAJOR_NUM, 5, char *)
-#define IOCTL_GET_RT_MSG _IOR(MAJOR_NUM, 6, char *)
-#define IOCTL_GET_CT_DATA _IOR(MAJOR_NUM, 7, char *)
-#define IOCTL_GET_TMC_CHANNEL _IOR(MAJOR_NUM, 8, char *)
+#define PRIVATE_IOCTL_TYPE 100
+/* Private ioctl commands */
+#define IOCTL_GET_EVENT_MASK _IOR(PRIVATE_IOCTL_TYPE, GET_EVENT_MASK, __u32)
+#define IOCTL_GET_PI_CODE _IOR(PRIVATE_IOCTL_TYPE, GET_PI_CODE, __u16)
+#define IOCTL_GET_TP_CODE _IOR(PRIVATE_IOCTL_TYPE, GET_TP_CODE, __u8)
+#define IOCTL_GET_PTY_CODE _IOR(PRIVATE_IOCTL_TYPE, GET_PTY_CODE, __u8)
+#define IOCTL_GET_TA_CODE _IOR(PRIVATE_IOCTL_TYPE, GET_TA_CODE, __u8)
+#define IOCTL_GET_MS_CODE _IOR(PRIVATE_IOCTL_TYPE, GET_MS_CODE, __u8)
+#define IOCTL_GET_PS_CODE _IOR(PRIVATE_IOCTL_TYPE, GET_PS_CODE, __u8[8+1])
+#define IOCTL_GET_RT_MSG _IOR(PRIVATE_IOCTL_TYPE, GET_RT_MSG, __u8[64+1])
+#define IOCTL_GET_CT_DATA _IOR(PRIVATE_IOCTL_TYPE, GET_CT_DATA, __u8[7])
+#define IOCTL_GET_TMC_CHANNEL _IOR(PRIVATE_IOCTL_TYPE, GET_TMC_CHANNEL, __u8)
 
+/* Private control ids specific to this driver */
+#define V4L2_CID_FMRADIO_BAND (V4L2_CID_BASE+45)
 
 /*These values are set and has to be sent together.*/
 /*Keep them as a set always, never try to further seperate them*/
@@ -85,6 +85,9 @@ unsigned char i2s_master_on_pcm_pins[5] = {0x05, 0x19, 0x18, 0x18, 0x18};
 unsigned char bt_slave_on_pcm_pins[5] = {0x01, 0x19, 0x18, 0x19, 0x19};
 /*PCM works in master mode. Host side has to be slave*/
 unsigned char bt_master_on_pcm_pins[5] = {0x01, 0x19, 0x18, 0x18, 0x18 };
+
+/* scan_step type -> scan_step size mapping */
+extern const unsigned short fm_sch_step_size[];
 
 /* set this module parameter to enable debug info */
 extern int fm_dbg_param;
@@ -125,23 +128,17 @@ struct v4l2_queryctrl fmdrv_v4l2_queryctrl[] = {
         .id = V4L2_CID_AUDIO_LOUDNESS,
         .flags = V4L2_CTRL_FLAG_DISABLED,
     },
-// may need private control
+/* private controls */
+    {
+        .id = V4L2_CID_FMRADIO_BAND,
+        .type = V4L2_CTRL_TYPE_BOOLEAN,
+        .name = "Band",
+        .minimum = 0,
+        .maximum = 5,
+        .step = 1,
+        .default_value = DEF_V4L2_FM_BAND,
+    },
 };
-
-
-#if V4L2_FM_DEBUG
-#define V4L2_FM_DRV_DBG(flag, fmt, arg...) \
-        do { \
-            if (fm_dbg_param & flag) \
-                printk(KERN_DEBUG "(v4l2fmdrv):%s  "fmt"\n" , \
-                                           __func__,## arg); \
-        } while(0)
-#else
-#define V4L2_FM_DRV_DBG(flag, fmt, arg...)
-#endif
-#define V4L2_FM_DRV_ERR(fmt, arg...)  printk(KERN_ERR "(v4l2fmdrv):%s  "fmt"\n" , \
-                                           __func__,## arg)
-
 
 
 /************************************************************************************
@@ -149,9 +146,26 @@ struct v4l2_queryctrl fmdrv_v4l2_queryctrl[] = {
 ************************************************************************************/
 
 static struct video_device *gradio_dev;
-static unsigned char radio_disconnected;
-
 static atomic_t v4l2_device_available = ATOMIC_INIT(1);
+static atomic_t v4l2_device_ref_count = ATOMIC_INIT(0);
+
+/************************************************************************************
+**  Macro helpers
+************************************************************************************/
+
+#define INC_DEVICE_REF_COUNT \
+do { \
+    if(!atomic_add_unless(&v4l2_device_ref_count, 1, 0)) { \
+        V4L2_FM_DRV_ERR("Device is not ready"); \
+        return -EINVAL; \
+    } \
+} while (false)
+
+#define DEC_DEVICE_REF_COUNT \
+do { \
+    smp_mb__before_atomic(); \
+    atomic_dec(&v4l2_device_ref_count); \
+} while (false)
 
 /************************************************************************************
 **  Forward function declarations
@@ -172,19 +186,16 @@ static ssize_t fm_v4l2_fops_read(struct file *file, char __user * buf,
                     size_t count, loff_t *ppos)
 {
     int ret, bytes_read;
-    struct fmdrv_ops *fmdev;
+    struct fmdrv_ops *fmdev = video_drvdata(file);
 
-    fmdev = video_drvdata(file);
+    INC_DEVICE_REF_COUNT;
 
-    if (!radio_disconnected) {
-        V4L2_FM_DRV_ERR("(fmdrv): FM device is already disconnected\n");
-        ret = -EIO;
-        return ret;
-    }
 
     /* Copy RDS data from the cicular buffer to userspace */
     bytes_read =
         fmc_transfer_rds_from_cbuff(fmdev, file, buf, count);
+
+    INC_DEVICE_REF_COUNT;
     return bytes_read;
 }
 
@@ -193,102 +204,129 @@ static ssize_t fm_v4l2_fops_read(struct file *file, char __user * buf,
 static ssize_t fm_v4l2_fops_write(struct file *file, const char __user * buf,
                     size_t count, loff_t *ppos)
 {
-    return -EINVAL;
+    return -EOPNOTSUPP;
 }
+
+
 
 /* Handle Poll event for "/dev/radioX" device.*/
 static unsigned int fm_v4l2_fops_poll(struct file *file,
                       struct poll_table_struct *pts)
 {
-    int ret;
-    struct fmdrv_ops *fmdev;
+    unsigned int mask = 0;
+    struct fmdrv_ops *fmdev = video_drvdata(file);
 
-    V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(rds) %s", __func__ );
+    /*
+     * Checking if RDS data is available;
+     * note that fmc_is_rds_data_available has to be called,
+     * which will in turn call poll_wait to queue
+     * polling waiter, before atomic_read(&v4l2_device_ref_count),
+     * so that whenever ref_count > 0 and ret != 0 are observed
+     * (i.e. waiting is going to happen), that waiter will be
+     * eventually be woken up by wake_up_interruptible() in fmc_release() if the device gets closed while polling is still
+     * underway
+     */
+    int ret = fmc_is_rds_data_available(fmdev, file, pts);
 
-    fmdev = video_drvdata(file);
-    /* Check if RDS data is available */
-    ret = fm_rx_is_rds_data_available(fmdev, file, pts);
-    if (!ret)
-        return POLLIN | POLLRDNORM;
-    return 0;
+    smp_mb__before_atomic();
+
+    if(!atomic_read(&v4l2_device_ref_count)) {
+        V4L2_FM_DRV_ERR("The device is not ready for polling");
+        mask = POLLNVAL;
+    } else  {
+        if (!ret)
+            mask = POLLIN | POLLRDNORM;
+    }
+
+    return mask;
 }
 
 static ssize_t show_fmrx_comp_scan(struct device *dev,
         struct device_attribute *attr, char *buf)
 {
-    struct fmdrv_ops *fmdev = dev_get_drvdata(dev);
-
-    /* Chip doesn't support complete scan for weather band */
-    if (fmdev->rx.region.fm_band == FM_BAND_WEATHER)
-        return -EINVAL;
-
-    return sprintf(buf, "%d\n", fmdev->rx.no_of_chans);
+    return -EOPNOTSUPP;
 }
 
 static ssize_t store_fmrx_comp_scan(struct device *dev,
         struct device_attribute *attr, char *buf, size_t size)
 {
-    int ret;
+    ssize_t ret;
     unsigned long comp_scan;
     struct fmdrv_ops *fmdev = dev_get_drvdata(dev);
 
-    /* Chip doesn't support complete scan for weather band */
-    if (fmdev->rx.region.fm_band == FM_BAND_WEATHER)
-        return -EINVAL;
 
     if (kstrtoul(buf, 0, &comp_scan))
         return -EINVAL;
 
-    ret = fm_rx_seek_station(fmdev, 1, 0);// FM_CHANNEL_SPACING_200KHZ, comp_scan);
-    if (ret < 0)
-        V4L2_FM_DRV_ERR("RX complete scan failed - %d\n", ret);
+    INC_DEVICE_REF_COUNT;
 
-    if (comp_scan == COMP_SCAN_READ)
-        return (size_t) fmdev->rx.no_of_chans;
-    else
-        return size;
+    ret = fm_rx_seek_station(fmdev, 1, !!comp_scan);// FM_CHANNEL_SPACING_200KHZ, comp_scan);
+    if (ret < 0) {
+        V4L2_FM_DRV_ERR("RX complete scan failed - %d\n", ret);
+    }
+    else {
+        ret = size;
+    }
+
+    DEC_DEVICE_REF_COUNT;
+    return ret;
 }
 
 static ssize_t show_fmrx_deemphasis(struct device *dev,
         struct device_attribute *attr, char *buf)
 {
     struct fmdrv_ops *fmdev = dev_get_drvdata(dev);
+    size_t ret = 0;
 
-    return sprintf(buf, "%d\n", (fmdev->rx.region.deemphasis==
+    INC_DEVICE_REF_COUNT;
+    ret = sprintf(buf, "%d\n", (fmdev->rx.band_config.deemphasis==
                 FM_RX_EMPHASIS_FILTER_50_USEC) ? 50 : 75);
+
+    DEC_DEVICE_REF_COUNT;
+
+    return ret;
 }
 
 static ssize_t store_fmrx_deemphasis(struct device *dev,
         struct device_attribute *attr, char *buf, size_t size)
 {
-    int ret;
+    ssize_t ret;
     unsigned long deemph_mode;
     struct fmdrv_ops *fmdev = dev_get_drvdata(dev);
 
     if (kstrtoul(buf, 0, &deemph_mode))
         return -EINVAL;
 
+    INC_DEVICE_REF_COUNT;
     ret = fm_rx_config_deemphasis(fmdev,deemph_mode);
     if (ret < 0) {
         V4L2_FM_DRV_ERR("Failed to set De-emphasis Mode\n");
-        return ret;
+    } else {
+        ret = size;
     }
 
-    return size;
+    DEC_DEVICE_REF_COUNT;
+
+    return ret;
 }
 
 static ssize_t show_fmrx_af(struct device *dev,
         struct device_attribute *attr, char *buf)
 {
+    ssize_t ret = 0;
     struct fmdrv_ops *fmdev = dev_get_drvdata(dev);
 
-    return sprintf(buf, "%d\n", fmdev->rx.af_mode);
+    INC_DEVICE_REF_COUNT;
+    ret = sprintf(buf, "%d\n", fmdev->rx.af_mode);
+    DEC_DEVICE_REF_COUNT;
+
+    return ret;
 }
 
 static ssize_t store_fmrx_af(struct device *dev,
         struct device_attribute *attr, char *buf, size_t size)
 {
-    int ret;
+    ssize_t ret;
     unsigned long af_mode;
     struct fmdrv_ops *fmdev = dev_get_drvdata(dev);
 
@@ -298,219 +336,262 @@ static ssize_t store_fmrx_af(struct device *dev,
     if (af_mode < 0 || af_mode > 1)
         return -EINVAL;
 
+    INC_DEVICE_REF_COUNT;
     ret = fm_rx_set_af_switch(fmdev, af_mode);
     if (ret < 0) {
         V4L2_FM_DRV_ERR("Failed to set AF Switch\n");
-        return ret;
+    } else {
+        ret = size;
     }
+    DEC_DEVICE_REF_COUNT;
 
-    return size;
+    return ret;
 }
 
 static ssize_t show_fmrx_band(struct device *dev,
         struct device_attribute *attr, char *buf)
 {
+    ssize_t ret = 0;
     struct fmdrv_ops *fmdev = dev_get_drvdata(dev);
 
-    return sprintf(buf, "%d\n", fmdev->rx.region.fm_band);
+    INC_DEVICE_REF_COUNT;
+    ret = sprintf(buf, "%d\n", fmdev->rx.band_config.fm_band);
+    DEC_DEVICE_REF_COUNT;
+
+    return ret;
 }
 
 static ssize_t store_fmrx_band(struct device *dev,
         struct device_attribute *attr, char *buf, size_t size)
 {
-    int ret;
+    ssize_t ret;
     unsigned long fm_band;
     struct fmdrv_ops *fmdev = dev_get_drvdata(dev);
     if (kstrtoul(buf, 0, &fm_band))
         return -EINVAL;
-    pr_info("store_fmrx_band In  fm_band %ld",fm_band);
 
-    if (fm_band < FM_BAND_EUROPE || fm_band >= FM_BAND_WEATHER)
-        return -EINVAL;
-
-    ret = fm_rx_set_region(fmdev, fm_band);
+    INC_DEVICE_REF_COUNT;
+    ret = fm_rx_set_band(fmdev, fm_band);
     if (ret < 0) {
         V4L2_FM_DRV_ERR("Failed to set FM Band\n");
-        return ret;
+    } else {
+        ret = size;
     }
+    DEC_DEVICE_REF_COUNT;
 
-    return size;
+    return ret;
 }
 
 static ssize_t show_fmrx_fm_audio_pins(struct device *dev,
         struct device_attribute *attr, char *buf)
 {
+    ssize_t ret = 0;
     struct fmdrv_ops *fmdev = dev_get_drvdata(dev);
 
-    return sprintf(buf, "%s\n", fmdev->rx.current_pins);
+    INC_DEVICE_REF_COUNT;
+    ret = sprintf(buf, "%s\n", fmdev->rx.current_pins);
+    DEC_DEVICE_REF_COUNT;
+
+    return ret;
 }
 
 static ssize_t store_fmrx_fm_audio_pins(struct device *dev,
         struct device_attribute *attr, char *buf, size_t size)
 {
-    int ret = 0;
+    ssize_t ret = 0;
     struct fmdrv_ops *fmdev = dev_get_drvdata(dev);
-    if(strncmp(buf, fmdev->rx.current_pins, 3) == 0) /*I2S or PCM*/
-    {
-        return size;
+
+    INC_DEVICE_REF_COUNT;
+
+    if(strncmp(buf, fmdev->rx.current_pins, 3)) { /*I2S or PCM*/
+        if(strncmp(buf, "PCM", 3) == 0) /*use PCM pins*/
+        {
+            //send VSC to switch I2S to PCM pins
+     #if ROUTE_FM_I2S_MASTER_TO_PCM_PINS
+            V4L2_FM_DRV_DBG(V4L2_DBG_OPEN, "Routing I2S audio over PCM pins in master mode");
+            ret = fmc_send_cmd(fmdev, 0, i2s_master_on_pcm_pins, 5, VSC_HCI_CMD, NULL, NULL);
+            if (ret < 0)
+            {
+                V4L2_FM_DRV_ERR("(fmdrv): Error setting switch I2s path to PCM pins as a master");
+                goto out;
+            }
+    #endif
+
+    #if ROUTE_FM_I2S_SLAVE_TO_PCM_PINS
+            V4L2_FM_DRV_DBG(V4L2_DBG_OPEN, "Routing I2S audio over PCM pins in slave mode");
+            ret = fmc_send_cmd(fmdev, 0, i2s_slave_on_pcm_pins, 5, VSC_HCI_CMD, NULL, NULL);
+            if (ret < 0)
+            {
+                V4L2_FM_DRV_ERR("(fmdrv): Error setting switch I2s path to PCM pins as a slave");
+                goto out;
+            }
+    #endif
+            sprintf(fmdev->rx.current_pins, "%s", buf);
+        }
+        else if(strncmp(buf, "I2S", 3) == 0) /*use I2S pins and release PCM pins for BT SCO*/
+        {
+        /*send VSC to release PCM pins*/
+    #if ROUTE_BT_I2S_MASTER_TO_PCM_PINS
+            V4L2_FM_DRV_DBG(V4L2_DBG_OPEN, "Routing I2S audio over PCM pins in master mode");
+            ret = fmc_send_cmd(fmdev, 0, bt_master_on_pcm_pins, 5, VSC_HCI_CMD, NULL, NULL);
+            if (ret < 0)
+            {
+                V4L2_FM_DRV_ERR("(fmdrv): Error setting switch I2s path to PCM pins as a master");
+                goto out;
+            }
+    #endif
+
+    #if ROUTE_FM_I2S_SLAVE_TO_PCM_PINS
+            V4L2_FM_DRV_DBG(V4L2_DBG_OPEN, "Routing I2S audio over PCM pins in slave mode");
+            ret = fmc_send_cmd(fmdev, 0, bt_slave_on_pcm_pins, 5, VSC_HCI_CMD, NULL, NULL);
+            if (ret < 0)
+            {
+                V4L2_FM_DRV_ERR("(fmdrv): Error setting switch I2s path to PCM pins as a slave");
+                goto out;
+            }
+    #endif
+            sprintf(fmdev->rx.current_pins, "%s", buf);
+        }
+        else
+        {
+            V4L2_FM_DRV_ERR("Wrong value: either PCM or I2S\n");
+            ret = -EINVAL;
+        }
     }
 
-    else if(strncmp(buf, "PCM", 3) == 0) /*use PCM pins*/
-    {
-        //send VSC to switch I2S to PCM pins
- #if ROUTE_FM_I2S_MASTER_TO_PCM_PINS
-        V4L2_FM_DRV_DBG(V4L2_DBG_OPEN, "Routing I2S audio over PCM pins in master mode");
-        ret = fmc_send_cmd(fmdev, 0, i2s_master_on_pcm_pins, 5, VSC_HCI_CMD, &fmdev->maintask_completion, NULL, NULL);
-        if (ret < 0)
-        {
-            V4L2_FM_DRV_ERR("(fmdrv): Error setting switch I2s path to PCM pins as a master");
-            return ret;
-        }
-#endif
+out:
+    if (!ret)
+        ret = size;
 
-#if ROUTE_FM_I2S_SLAVE_TO_PCM_PINS
-    V4L2_FM_DRV_DBG(V4L2_DBG_OPEN, "Routing I2S audio over PCM pins in slave mode");
-    ret = fmc_send_cmd(fmdev, 0, i2s_slave_on_pcm_pins, 5, VSC_HCI_CMD, &fmdev->maintask_completion, NULL, NULL);
-    if (ret < 0)
-    {
-        V4L2_FM_DRV_ERR("(fmdrv): Error setting switch I2s path to PCM pins as a slave");
-        return ret;
-    }
-#endif
-    sprintf(fmdev->rx.current_pins, "%s", buf);
-    return size;
-    }
-    else if(strncmp(buf, "I2S", 3) == 0) /*use I2S pins and release PCM pins for BT SCO*/
-    {
-    /*send VSC to release PCM pins*/
-#if ROUTE_BT_I2S_MASTER_TO_PCM_PINS
-        V4L2_FM_DRV_DBG(V4L2_DBG_OPEN, "Routing I2S audio over PCM pins in master mode");
-        ret = fmc_send_cmd(fmdev, 0, bt_master_on_pcm_pins, 5, VSC_HCI_CMD, &fmdev->maintask_completion, NULL, NULL);
-        if (ret < 0)
-        {
-            V4L2_FM_DRV_ERR("(fmdrv): Error setting switch I2s path to PCM pins as a master");
-            return ret;
-        }
-#endif
-
-#if ROUTE_FM_I2S_SLAVE_TO_PCM_PINS
-        V4L2_FM_DRV_DBG(V4L2_DBG_OPEN, "Routing I2S audio over PCM pins in slave mode");
-        ret = fmc_send_cmd(fmdev, 0, bt_slave_on_pcm_pins, 5, VSC_HCI_CMD, &fmdev->maintask_completion, NULL, NULL);
-        if (ret < 0)
-        {
-            V4L2_FM_DRV_ERR("(fmdrv): Error setting switch I2s path to PCM pins as a slave");
-            return ret;
-        }
-#endif
-        sprintf(fmdev->rx.current_pins, "%s", buf);
-        return size;
-    }
-    else
-    {
-        V4L2_FM_DRV_ERR("Wrong value: either PCM or I2S\n");
-        return ret;
-    }
-    return size;
+    DEC_DEVICE_REF_COUNT;
+    return ret;
 }
 
 
 static ssize_t show_fmrx_rssi_lvl(struct device *dev,
         struct device_attribute *attr, char *buf)
 {
+    ssize_t ret = 0;
     struct fmdrv_ops *fmdev = dev_get_drvdata(dev);
 
-    return sprintf(buf, "%d\n", fmdev->rx.curr_rssi_threshold);
+    INC_DEVICE_REF_COUNT;
+    ret = sprintf(buf, "%d\n", fmdev->rx.curr_rssi_threshold);
+    DEC_DEVICE_REF_COUNT;
+
+    return ret;
 }
 
 static ssize_t store_fmrx_rssi_lvl(struct device *dev,
         struct device_attribute *attr, char *buf, size_t size)
 {
-    int ret;
+    ssize_t ret;
     unsigned long rssi_lvl;
     struct fmdrv_ops *fmdev = dev_get_drvdata(dev);
 
     if (kstrtoul(buf, 0, &rssi_lvl))
         return -EINVAL;
 
+    INC_DEVICE_REF_COUNT;
+
     ret = fm_rx_set_rssi_threshold(fmdev, rssi_lvl);
     if (ret < 0) {
         V4L2_FM_DRV_ERR("Failed to set RSSI level\n");
-        return ret;
+    } else {
+        ret = size;
     }
 
-    return size;
+    DEC_DEVICE_REF_COUNT;
+
+    return ret;
 }
 
 static ssize_t show_fmrx_snr_lvl(struct device *dev,
         struct device_attribute *attr, char *buf)
 {
+    ssize_t ret = 0;
     struct fmdrv_ops *fmdev = dev_get_drvdata(dev);
 
-    return sprintf(buf, "%d\n", fmdev->rx.curr_snr_threshold);
+    INC_DEVICE_REF_COUNT;
+    ret = sprintf(buf, "%d\n", fmdev->rx.curr_snr_threshold);
+    DEC_DEVICE_REF_COUNT;
 }
 
 static ssize_t store_fmrx_snr_lvl(struct device *dev,
         struct device_attribute *attr, char *buf, size_t size)
 {
-    int ret;
+    ssize_t ret;
     unsigned long snr_lvl;
     struct fmdrv_ops *fmdev = dev_get_drvdata(dev);
 
     if (kstrtoul(buf, 0, &snr_lvl))
         return -EINVAL;
 
+    INC_DEVICE_REF_COUNT;
+
     ret = fm_rx_set_snr_threshold(fmdev, snr_lvl);
     if (ret < 0) {
         V4L2_FM_DRV_ERR("Failed to set SNR level\n");
-        return ret;
+    } else {
+        ret = size;
     }
 
-    return size;
+    DEC_DEVICE_REF_COUNT;
+
+    return ret;
 }
 
 static ssize_t show_fmrx_channel_space(struct device *dev,
         struct device_attribute *attr, char *buf)
 {
+    ssize_t ret = 0;
     struct fmdrv_ops *fmdev = dev_get_drvdata(dev);
 
-    return sprintf(buf, "%d\n", fmdev->rx.sch_step);
+    INC_DEVICE_REF_COUNT;
+    ret = sprintf(buf, "%d\n", fm_sch_step_size[fmdev->rx.band_config.scan_step] / fm_sch_step_size[FM_STEP_50KHZ]);
+    DEC_DEVICE_REF_COUNT;
+
+    return ret;
 }
 
 static ssize_t store_fmrx_channel_space(struct device *dev,
         struct device_attribute *attr, char *buf, size_t size)
 {
-    int ret;
-    unsigned long chl_spacing,chl_step;
+    ssize_t ret;
+    unsigned long chl_spacing, chl_scan_step;
     struct fmdrv_ops *fmdev = dev_get_drvdata(dev);
 
     if (kstrtoul(buf, 0, &chl_spacing))
         return -EINVAL;
     switch( chl_spacing){
         case CHL_SPACE_ONE:
-            chl_step= FM_STEP_50KHZ;
+            chl_scan_step= FM_STEP_50KHZ;
             break;
         case CHL_SPACE_TWO:
-            chl_step= FM_STEP_100KHZ;
+            chl_scan_step= FM_STEP_100KHZ;
             break;
         case CHL_SPACE_FOUR:
-            chl_step= FM_STEP_200KHZ;
+            chl_scan_step= FM_STEP_200KHZ;
             break;
         default:
-            chl_step= FM_STEP_100KHZ;
+            chl_scan_step= FM_STEP_100KHZ;
+            break;
     };
-    ret = fmc_set_scan_step(fmdev, chl_spacing);
+
+    INC_DEVICE_REF_COUNT;
+
+    ret = fmc_set_scan_step(fmdev, chl_scan_step);
     if (ret < 0) {
         V4L2_FM_DRV_ERR("Failed to set channel spacing\n");
-        return ret;
+    } else {
+        ret = size;
     }
 
-    return size;
+    DEC_DEVICE_REF_COUNT;
+
+    return ret;
 }
 
 /* structures specific for sysfs entries
- * FM GUI app belongs to group "fmradio", these sysfs entries belongs to "root",
- * but GUI app needs both read and write permissions to these sysfs entires for
- * below features, so these entries got permission "666"
  */
 
 /* To start FM RX complete scan*/
@@ -578,20 +659,14 @@ static int notify_topology(struct video_device *radio_dev)
 static int fm_v4l2_fops_open(struct file *file)
 {
     int ret = -EINVAL;
-    unsigned char option;
+    unsigned char fm_band = DEF_V4L2_FM_BAND;
     struct fmdrv_ops *fmdev = NULL;
     V4L2_FM_DRV_DBG(V4L2_DBG_OPEN, "(fmdrv): fm_v4l2_fops_open");
     /* Don't allow multiple open */
-    if(!atomic_dec_and_test(&v4l2_device_available))
+    if(!atomic_add_unless(&v4l2_device_available, -1, 0))
     {
-        atomic_inc(&v4l2_device_available);
         V4L2_FM_DRV_ERR("(fmdrv): FM device is already opened\n");
         return -EBUSY;
-    }
-
-    if (radio_disconnected) {
-        V4L2_FM_DRV_ERR("(fmdrv): FM device is already opened\n");
-        return  -EBUSY;
     }
 
     fmdev = video_drvdata(file);
@@ -599,37 +674,25 @@ static int fm_v4l2_fops_open(struct file *file)
     ret = fmc_prepare(fmdev);
     if (ret < 0) {
         V4L2_FM_DRV_ERR("(fmdrv): Unable to prepare FM CORE");
-        return ret;
+        goto out;
     }
-
-    radio_disconnected = 1;
 
     ret = fmc_set_mode(fmdev, FM_MODE_RX); /* As of now, support only Rx */
 
-#if(defined(DEF_V4L2_FM_WORLD_REGION) && DEF_V4L2_FM_WORLD_REGION == FM_REGION_NA)
-    option = FM_REGION_NA | FM_RBDS_BIT;
-#elif(defined(DEF_V4L2_FM_WORLD_REGION) && DEF_V4L2_FM_WORLD_REGION == FM_REGION_EUR)
-    option = FM_REGION_EUR | FM_RDS_BIT;
-#elif(defined(DEF_V4L2_FM_WORLD_REGION) && DEF_V4L2_FM_WORLD_REGION == FM_REGION_JP)
-    option = FM_REGION_JP | FM_RDS_BIT;
-#else
-    option = 0;
-#endif
-
     /* Enable FM */
-    V4L2_FM_DRV_DBG(V4L2_DBG_OPEN,"(fmdrv): FM Enable INIT option : %d", option);
-    ret = fmc_enable(fmdev, option);
+    V4L2_FM_DRV_DBG(V4L2_DBG_OPEN,"(fmdrv): FM Enable INIT fm_band: %hhu", fm_band);
+    ret = fmc_enable(fmdev, fm_band);
     if (ret < 0) {
         V4L2_FM_DRV_ERR("(fmdrv): Unable to enable FM");
-        return ret;
+        goto out;
     }
 
     /* Set Audio mode */
-    V4L2_FM_DRV_DBG(V4L2_DBG_OPEN,"(fmdrv): FM Set Audio mode option : %d", DEF_V4L2_FM_AUDIO_MODE);
+    V4L2_FM_DRV_DBG(V4L2_DBG_OPEN,"(fmdrv): FM Set Audio mode: %d", DEF_V4L2_FM_AUDIO_MODE);
     ret = fmc_set_audio_mode(fmdev, DEF_V4L2_FM_AUDIO_MODE);
     if (ret < 0) {
         V4L2_FM_DRV_ERR("(fmdrv): Error setting Audio mode during FM enable operation");
-        return ret;
+        goto out;
     }
 
     /* Register sysfs entries */
@@ -637,40 +700,47 @@ static int fm_v4l2_fops_open(struct file *file)
             &v4l2_fm_attr_grp);
     if (ret) {
         V4L2_FM_DRV_ERR("failed to create sysfs entries");
-        return ret;
+        goto out;
     }
 
     /* Notify new sysfs entries */
     notify_topology(fmdev->radio_dev);
 
     /* Set Audio path */
-    V4L2_FM_DRV_DBG(V4L2_DBG_OPEN,"(fmdrv): FM Set Audio path option : %d", DEF_V4L2_FM_AUDIO_PATH);
+    V4L2_FM_DRV_DBG(V4L2_DBG_OPEN,"(fmdrv): FM Set Audio path: %d", DEF_V4L2_FM_AUDIO_PATH);
     ret = fm_rx_config_audio_path(fmdev, DEF_V4L2_FM_AUDIO_PATH);
     if (ret < 0) {
         V4L2_FM_DRV_ERR("(fmdrv): Error setting Audio path during FM enable operation");
-        return ret;
+        goto out;
     }
 
 #if ROUTE_FM_I2S_MASTER_TO_PCM_PINS
     V4L2_FM_DRV_DBG(V4L2_DBG_OPEN, "Routing I2S audio over PCM pins in master mode");
-    ret = fmc_send_cmd(fmdev, 0, i2s_master_on_pcm_pins, 5, VSC_HCI_CMD, &fmdev->maintask_completion, NULL, NULL);
+    ret = fmc_send_cmd(fmdev, 0, i2s_master_on_pcm_pins, 5, VSC_HCI_CMD, NULL, NULL);
     if (ret < 0) {
         V4L2_FM_DRV_ERR("(fmdrv): Error setting switch I2s path to PCM pins as a master");
-        return ret;
+        goto out;
     }
 #endif
 
 #if ROUTE_FM_I2S_SLAVE_TO_PCM_PINS
     V4L2_FM_DRV_DBG(V4L2_DBG_OPEN, "Routing I2S audio over PCM pins in slave mode");
-    ret = fmc_send_cmd(fmdev, 0, i2s_slave_on_pcm_pins, 5, VSC_HCI_CMD, &fmdev->maintask_completion, NULL, NULL);
+    ret = fmc_send_cmd(fmdev, 0, i2s_slave_on_pcm_pins, 5, VSC_HCI_CMD, NULL, NULL);
     if (ret < 0)
     {
         V4L2_FM_DRV_ERR("(fmdrv): Error setting switch I2s path to PCM pins as a slave");
-        return ret;
+        goto out;
     }
 #endif
 
-    return 0;
+out:
+    smp_mb__before_atomic();
+    if (ret) {
+        atomic_inc(&v4l2_device_available);
+    } else {
+        atomic_inc(&v4l2_device_ref_count);
+    }
+    return ret;
 }
 
 /* Handle close request for "/dev/radioX" device.
@@ -683,10 +753,15 @@ static int fm_v4l2_fops_release(struct file *file)
 
     fmdev = video_drvdata(file);
 
-    if (!radio_disconnected) {
+    if (atomic_read(&v4l2_device_available)) {
         V4L2_FM_DRV_DBG(V4L2_DBG_CLOSE, "(fmdrv):FM dev already closed, close called again?");
-        return ret;
+        return -EINVAL;
     }
+    else if (atomic_cmpxchg(&v4l2_device_ref_count, 1, 0) != 1) {
+        V4L2_FM_DRV_DBG(V4L2_DBG_CLOSE, "(fmdrv):FM dev is in use");
+        return -EBUSY;
+    }
+
     /* First set audio path to NONE */
     ret = fm_rx_config_audio_path(fmdev, FM_AUDIO_NONE);
     if (ret < 0) {
@@ -695,7 +770,7 @@ static int fm_v4l2_fops_release(struct file *file)
     }
 #if ROUTE_FM_I2S_MASTER_TO_PCM_PINS
     V4L2_FM_DRV_DBG(V4L2_DBG_CLOSE, "Routing I2S audio over PCM pins in master mode");
-    ret = fmc_send_cmd(fmdev, 0, bt_master_on_pcm_pins, 5, VSC_HCI_CMD, &fmdev->maintask_completion, NULL, NULL);
+    ret = fmc_send_cmd(fmdev, 0, bt_master_on_pcm_pins, 5, VSC_HCI_CMD, NULL, NULL);
     if (ret < 0)
     {
         V4L2_FM_DRV_ERR("(fmdrv): Error setting switch I2s path to PCM pins as a master");
@@ -705,7 +780,7 @@ static int fm_v4l2_fops_release(struct file *file)
 
 #if ROUTE_FM_I2S_SLAVE_TO_PCM_PINS
     V4L2_FM_DRV_DBG(V4L2_DBG_CLOSE, "Routing I2S audio over PCM pins in slave mode");
-    ret = fmc_send_cmd(fmdev, 0, bt_slave_on_pcm_pins, 5, VSC_HCI_CMD, &fmdev->maintask_completion, NULL, NULL);
+    ret = fmc_send_cmd(fmdev, 0, bt_slave_on_pcm_pins, 5, VSC_HCI_CMD, NULL, NULL);
     if (ret < 0) {
         V4L2_FM_DRV_ERR("(fmdrv): Error setting switch I2s path to PCM pins as a slave");
         return ret;
@@ -727,7 +802,7 @@ static int fm_v4l2_fops_release(struct file *file)
         V4L2_FM_DRV_ERR("(fmdrv): FM CORE release failed");
         return ret;
     }
-    radio_disconnected = 0;
+    smp_mb__before_atomic();
     atomic_inc(&v4l2_device_available);
 
     return 0;
@@ -788,29 +863,36 @@ static int fm_v4l2_vidioc_g_ctrl(struct file *file, void *priv,
                     struct v4l2_control *ctrl)
 {
     int ret = -EINVAL;
-    unsigned short curr_vol;
-    unsigned char curr_mute_mode;
     struct fmdrv_ops *fmdev;
 
     fmdev = video_drvdata(file);
 
     switch (ctrl->id) {
-        case V4L2_CID_AUDIO_MUTE:    /* get mute mode */
+        case V4L2_CID_AUDIO_MUTE: {    /* get mute mode */
+            unsigned char curr_mute_mode;
+            V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(fmdrv): V4L2_CID_AUDIO_MUTE get");
             ret = fm_rx_get_mute_mode(fmdev, &curr_mute_mode);
-            if (ret < 0)
-                return ret;
-            ctrl->value = curr_mute_mode;
+            if (!ret)
+                ctrl->value = curr_mute_mode;
             break;
-
-        case V4L2_CID_AUDIO_VOLUME:    /* get volume */
-            V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv): V4L2_CID_AUDIO_VOLUME get");
+        }
+        case V4L2_CID_AUDIO_VOLUME: {    /* get volume */
+            unsigned short curr_vol;
+            V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(fmdrv): V4L2_CID_AUDIO_VOLUME get");
             ret = fm_rx_get_volume(fmdev, &curr_vol);
-            if (ret < 0)
-                return ret;
-            ctrl->value = curr_vol;
+            if (!ret)
+                ctrl->value = curr_vol;
             break;
-
-       default:
+        }
+        case V4L2_CID_FMRADIO_BAND: {
+            V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(fmdrv): V4L2_CID_FMRADIO_BAND get");
+            unsigned char fm_band;
+            ret = fmc_get_band(fmdev, &fm_band);
+            if (!ret)
+                ctrl->value = fm_band;
+            break;
+        }
+        default:
            V4L2_FM_DRV_ERR("(fmdrv): Unhandled IOCTL for get Control");
            break;
     }
@@ -832,20 +914,19 @@ static int fm_v4l2_vidioc_s_ctrl(struct file *file, void *priv,
 
     switch (ctrl->id) {
         case V4L2_CID_AUDIO_MUTE:    /* set mute */
+            V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv): V4L2_CID_AUDIO_MUTE, setting to %d", ctrl->value);
             ret = fm_rx_set_mute_mode(fmdev, (unsigned char)ctrl->value);
-            if (ret < 0)
-                return ret;
             break;
-
         case V4L2_CID_AUDIO_VOLUME:    /* set volume */
-            V4L2_FM_DRV_DBG(V4L2_DBG_TX,"(fmdrv): V4L2_CID_AUDIO_VOLUME set : %d", ctrl->value);
+            V4L2_FM_DRV_DBG(V4L2_DBG_TX,"(fmdrv): V4L2_CID_AUDIO_VOLUME, setting to %d", ctrl->value);
             ret = fm_rx_set_volume(fmdev, (unsigned short)ctrl->value);
-            if (ret < 0)
-                return ret;
             break;
-
+        case V4L2_CID_FMRADIO_BAND:
+            V4L2_FM_DRV_DBG(V4L2_DBG_TX,"(fmdrv): V4L2_CID_FMRADIO_BAND, setting to %d", ctrl->value);
+            ret = fmc_set_band(fmdev, (unsigned char)ctrl->value);
+            break;
         default:
-            V4L2_FM_DRV_ERR("(fmdrv): Unhandled IOCTL for set Control");
+            V4L2_FM_DRV_ERR("(fmdrv): set control id %d is not supported", ctrl->id);
             break;
     }
 
@@ -890,7 +971,7 @@ static int fm_v4l2_vidioc_g_tuner(struct file *file, void *priv,
     unsigned int high = 0, low = 0;
     int ret = -EINVAL;
     struct fmdrv_ops *fmdev;
-    unsigned char mode = 0;
+    unsigned char mode = 0, scan_step = 1;
 
     if (tuner->index != 0)
         return ret;
@@ -898,7 +979,11 @@ static int fm_v4l2_vidioc_g_tuner(struct file *file, void *priv,
     fmdev = video_drvdata(file);
     strcpy(tuner->name, "FM");
     tuner->type = fmdev->device_info.type;
-    /* The V4L2 specification defines all frequencies in unit of 62.5 kHz */
+    /* The V4L2 specification defines all frequencies in 62.5 Hz,
+     * so given a frequency value x in M / 100 Hz,
+     * it needs to be converted to the unit of 62.5 Hz by
+     * x * M / (100 * 62.5) = x * 100000 / 625
+     */
     ret = fm_rx_get_band_frequencies(fmdev, &low, &high);
     tuner->rangelow = (low * 100000)/625;
     tuner->rangehigh = (high * 100000)/625;
@@ -917,6 +1002,12 @@ static int fm_v4l2_vidioc_g_tuner(struct file *file, void *priv,
      FM rssi is cannot be 1~128dbm normally, although range is -128 to +127 */
 
     tuner->signal = (128-curr_rssi) * (65535 / 128);
+
+    /* Hack: using afc field to return the value of scan_step */
+    fm_rx_get_scan_step(fmdev, &scan_step);
+    /* Converting the unit of scan_step size from K to 62.5 */
+    tuner->afc = fm_sch_step_size[scan_step] * 16;
+
     ret = 0;
     return ret;
 }
@@ -937,9 +1028,9 @@ static int fm_v4l2_vidioc_s_tuner(struct file *file, void *priv,
     fmdev = video_drvdata(file);
 
     /* TODO : Figure out how to set the region based on lower/upper freq */
-    /* The V4L2 specification defines all frequencies in unit of 62.5 kHz.
-    Hence translate the incoming tuner band frequencies to controller
-    recognized values. Set only if rangelow/rangehigh is not 0*/
+    /* The V4L2 specification defines all frequencies in 62.5 Hz.
+    Hence translate the incoming tuner band frequencies (in 62.5 Hz) to controller
+    recognized values (in M / 100 Hz). Set only if rangelow/rangehigh is not 0*/
     if(tuner->rangelow != 0 && tuner->rangehigh != 0)
     {
         V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv) rangelow:%d rangehigh:%d", tuner->rangelow, tuner->rangehigh);
@@ -972,7 +1063,7 @@ static int fm_v4l2_vidioc_g_frequency(struct file *file, void *priv,
     ret = fmc_get_frequency(fmdev, &freq->frequency);
     /* Translate the controller frequency to V4L2 specific frequency
         (frequencies in unit of 62.5 Hz):
-        x = (y * 100) * 1000/62.5  = y * 160 */
+        x = (y / 100) * 1000000/62.5  = y * 160 */
     freq->frequency = (freq->frequency * 160);
     if (ret < 0)
         return ret;
@@ -1019,70 +1110,36 @@ static int fm_v4l2_vidioc_s_hw_freq_seek(struct file *file, void *priv,
 
 
 /* This function is called whenever a process tries to
- * do an ioctl on this radio device. We get two extra
- * parameters (additional to the inode and file
- * structures, which all device functions get): the number
- * of the ioctl called and the parameter given to the
- * ioctl function.
+ * do an ioctl on this radio device.
  *
- * If the ioctl is write or read/write (meaning output
- * is returned to the calling process), the ioctl call
- * returns the output of this function.
- * Very important is that this is the Private IOCTL function to handle  RDA psrser
- * IOCTL commands. V4L2 framework also issues some IOCTLs which we have to route
- * them to video_ioctl2 function. So all the IOCTL other than Private ones are
- * passed to video_ioctl2 function.
- * And another important thing is that, it's good to return from this function as soon as
-* we handle Private IOCTL so return statement is used insteadof break.
+ * Importantly, this implementation handles both private commands, which provide the funtionalities of RDS data retrieval, and
+ * commands supported by V4L2 framework,
+ * by routing them to either fmc_get_rds_element_value() or video_ioctl2().
+ *
+ * Also note that the V4L2 framework locking mechanism
+ * (using "lock" field in "struct video_device" to serialise ioctl requests) only
+ * takes effect inside video_ioctl2(), so fmc_get_rds_element_value(),
+ * which is fine operating without locking, is not protected by the framework lock.
  */
-long rds_info_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+long fm_v4l2_fops_ioctl(struct file *file, unsigned int cmd, void __user *argp)
 {
+    long ret = -EINVAL;
+
+    INC_DEVICE_REF_COUNT;
+
     /* Switch according to the ioctl called */
-    long ret = 0;
-/* Process if it is private IOCTL*/
-    switch (cmd) {
-        case IOCTL_GET_PI_CODE:
-           V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_PI_CODE");
-           get_rds_element_value(GET_PI_CODE, (char *)arg);
-           return 1;
-        case IOCTL_GET_TP_CODE:
-           V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_TP_CODE");
-           get_rds_element_value(GET_TP_CODE, (char *)arg);
-           return 1;
-        case IOCTL_GET_PTY_CODE:
-           V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_PTY_CODE");
-           get_rds_element_value(GET_PTY_CODE, (char *)arg);
-           return 1;
-        case IOCTL_GET_TA_CODE:
-           V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_TA_CODE");
-           get_rds_element_value(GET_TA_CODE, (char *)arg);
-           return 1;
-        case IOCTL_GET_MS_CODE:
-           V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_MS_CODE");
-            get_rds_element_value(GET_MS_CODE, (char *)arg);
-           return 1;
-        case IOCTL_GET_PS_CODE:
-           V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_PS_CODE");
-           get_rds_element_value(GET_PS_CODE, (char *)arg);
-           return 1;
-        case IOCTL_GET_RT_MSG:
-           V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_RT_MSG");
-           get_rds_element_value(GET_RT_MSG, (char *)arg);
-           return 1;
-        case IOCTL_GET_CT_DATA:
-           V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_CT_DATA");
-           get_rds_element_value(GET_CT_DATA, (char *)arg);
-           return 1;
-        case IOCTL_GET_TMC_CHANNEL:
-           V4L2_FM_DRV_DBG(V4L2_DBG_RX, "IOCTL_GET_TMC_CHANNEL");
-           get_rds_element_value(GET_TMC_CHANNEL, (char *)arg);
-           return 1;
-        default:
-           V4L2_FM_DRV_DBG(V4L2_DBG_RX, "Invalid IOCTL");
-           break;
+    __u32 type = _IOC_TYPE(cmd);
+    if (type == PRIVATE_IOCTL_TYPE) {
+        /* trying to process cmd as a private ioctl which queries rds info */
+        ret = fmc_get_rds_element_value(_IOC_NR(cmd), argp);
     }
-/* If anything other than private will be passed to V4L2 framework */
-    ret = video_ioctl2(file, cmd, arg);
+    else {
+        /* In any other cases, letting the v4l2 framework to handle it */
+        ret = video_ioctl2(file, cmd, argp);
+    }
+
+    DEC_DEVICE_REF_COUNT;
+
     return ret;
 }
 
@@ -1091,8 +1148,8 @@ static const struct v4l2_file_operations fm_drv_fops = {
     .read = fm_v4l2_fops_read,
     .write = fm_v4l2_fops_write,
     .poll = fm_v4l2_fops_poll,
-/*This is the private IOCTL to handle RDS parser related IOCTLs*/
-    .unlocked_ioctl = rds_info_ioctl,
+    /*This is ioctl implementation includes the support of private commands which handle RDS data retrieval*/
+    .unlocked_ioctl = fm_v4l2_fops_ioctl,
     .open = fm_v4l2_fops_open,
     .release = fm_v4l2_fops_release,
 };
@@ -1124,19 +1181,20 @@ int fm_v4l2_init_video_device(struct fmdrv_ops *fmdev, int radio_nr)
 {
     int ret = -ENOMEM;
 
+    gradio_dev = NULL;
     strlcpy(fmdev->v4l2_dev.name, FM_DRV_NAME, sizeof(fmdev->v4l2_dev.name));
     ret = v4l2_device_register(NULL, &fmdev->v4l2_dev);
     if (ret < 0) {
-        pr_err("(fmdrv): Can't register v4l2 device");
-        return ret;
+        V4L2_FM_DRV_ERR("(fmdrv): Can't register v4l2 device");
+        goto out;
     }
 
-    gradio_dev = NULL;
     /* Allocate new video device */
     gradio_dev = video_device_alloc();
     if (NULL == gradio_dev) {
-        pr_err("(fmdrv): Can't allocate video device");
-        return -ENOMEM;
+        V4L2_FM_DRV_ERR("(fmdrv): Can't allocate video device");
+        ret = -ENOMEM;
+        goto error_vd_alloc;
     }
 
     /* Setup FM driver's V4L2 properties */
@@ -1144,30 +1202,54 @@ int fm_v4l2_init_video_device(struct fmdrv_ops *fmdev, int radio_nr)
 
     video_set_drvdata(gradio_dev, fmdev);
     gradio_dev->v4l2_dev = &fmdev->v4l2_dev;
+    gradio_dev->lock = kzalloc(sizeof(struct mutex), GFP_KERNEL);
+    if (!gradio_dev->lock) {
+        V4L2_FM_DRV_ERR("(fmdrv): Can't allocate video device");
+        ret = -ENOMEM;
+        goto error_lock_alloc;
+    }
+
+    mutex_init(gradio_dev->lock);
 
     /* Register with V4L2 subsystem as RADIO device */
     if (video_register_device(gradio_dev, VFL_TYPE_RADIO, radio_nr)) {
-        video_device_release(gradio_dev);
         V4L2_FM_DRV_ERR("(fmdrv): Could not register video device");
-        return -EINVAL;
+        ret = -EINVAL;
+        goto error_video_reg;
     }
 
     fmdev->radio_dev = gradio_dev;
     V4L2_FM_DRV_DBG(V4L2_DBG_INIT,"(fmdrv) registered with video device");
     ret = 0;
 
+    goto out;
+
+error_video_reg:
+    kfree(gradio_dev->lock);
+error_lock_alloc:
+    video_device_release(gradio_dev);
+    gradio_dev = NULL;
+error_vd_alloc:
+    v4l2_device_unregister(&fmdev->v4l2_dev);
+out:
     return ret;
 }
 
 void *fm_v4l2_deinit_video_device(void)
 {
-    struct fmdrv_ops *fmdev;
+    struct fmdrv_ops *fmdev = NULL;
 
-    fmdev = video_get_drvdata(gradio_dev);
-    /* Unregister RADIO device from V4L2 subsystem */
-    video_unregister_device(gradio_dev);
+    if (gradio_dev) {
+        fmdev = video_get_drvdata(gradio_dev);
+        /* Unregister RADIO device from V4L2 subsystem */
+        video_unregister_device(gradio_dev);
+        kfree(gradio_dev->lock);
+        video_device_release(gradio_dev);
+        gradio_dev = NULL;
 
-    v4l2_device_unregister(&fmdev->v4l2_dev);
+        if (fmdev)
+            v4l2_device_unregister(&fmdev->v4l2_dev);
+    }
 
     return fmdev;
 }

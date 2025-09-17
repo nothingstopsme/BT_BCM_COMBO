@@ -53,10 +53,11 @@
 #include <net/bluetooth/hci_core.h>
 
 #include "brcm_hci_uart.h"
-#include "../include/v4l2_target.h"
-#include "../include/fm.h"
-#include "../include/ant.h"
-#include "../include/v4l2_logs.h"
+#include "fm.h"
+#include "ant.h"
+#include "v4l2_logs.h"
+#include "wait_ext.h"
+#include "completion_ext.h"
 
 #include <linux/dirent.h>
 #include <linux/ctype.h>
@@ -68,26 +69,9 @@
 /*****************************************************************************
 **  Constants & Macros for dynamic logging
 *****************************************************************************/
-#ifndef BTLDISC_DEBUG
-#define BTLDISC_DEBUG TRUE
-#endif
 
 /* set this module parameter to enable debug info */
 int ldisc_dbg_param = 0;
-
-#if BTLDISC_DEBUG
-#define BT_LDISC_DBG(flag, fmt, arg...) \
-        do { \
-            if (ldisc_dbg_param & flag) \
-                printk(KERN_DEBUG "(brcmldisc):%s  "fmt"\n" , \
-                                           __func__,## arg); \
-        } while(0)
-#else
-#define BT_LDISC_DBG(flag, fmt, arg...)
-#endif
-
-#define BT_LDISC_ERR(fmt, arg...)  printk(KERN_ERR "(brcmldisc)ERR:%s  "fmt"\n" , \
-                                           __func__,## arg)
 
 #if V4L2_SNOOP_ENABLE
 /* parameter to enable HCI snooping */
@@ -98,23 +82,43 @@ int ldisc_snoop_enable_param = 0;
 **  Constants & Macros
 ************************************************************************************/
 
-#undef CONFIG_BT_HCIUART_BCSP
-#undef CONFIG_BT_HCIUART_LL
-#undef CONFIG_BT_HCIUART_H4
+/*
+ * ldisc states
+ */
+#define LDISC_OPENING   0
+#define LDISC_CLOSING   1
+#define LDISC_SUB_PROTO_REG_UNREG_IN_PROGRESS   2
+#define LDISC_STARTING   3
+#define LDISC_STOPPING   4
+#define LDISC_OPENED   5
+
+#define V4L2_HCI_PKT_MAX_SIZE 1050
+
+/* Various waiting times defined in msec */
+
+/* line discipline to be installed */
+#define LDISC_TIME             1500
+#define HCI_RESP_TIME          1000 // 800
+/* time for workaround in msec to wait for closed tty */
+#define TTY_CLOSE_TIME          20000
+
+#define POR_RETRY_COUNT        5
+
+/* install sysfs entry values */
+#define V4L2_STATUS_ERR '2'  // error occured in BT application (HCI command timeout or HW error)
+#define V4L2_STATUS_ON  '1'  // Atleast one procol driver is registered
+#define V4L2_STATUS_OFF '0'  // No procol drivers registered
+
+/* BT err flag values (bt_err) */
+#define  V4L2_ERR_FLAG_RESET '0'
+#define  V4L2_ERR_FLAG_SET   '1'
 
 
-#define PROTO_ENTRY(type, name) name
-const unsigned char *protocol_strngs[] = {
-    PROTO_ENTRY(ST_BT, "Bluetooth"),
-    PROTO_ENTRY(ST_FM, "FM"),
-    PROTO_ENTRY(ST_GPS, "GPS"),
-};
 /** Bluetooth Address */
 typedef struct {
     uint8_t address[6];
 } __attribute__((packed))bt_bdaddr_t;
 
-#define RESP_BUFF_SIZE 1024
 
 /* Baudrate threshold to change UART clock rate to 48 MHz */
 #define CLOCK_SET_BAUDRATE 3000000
@@ -125,20 +129,7 @@ typedef struct {
 #define BD_ADDR_SIZE 18
 #define LPM_PARAM_SIZE 100
 
-/* HCI HCI_V4L2 message type definitions */
-#define HCI_V4L2_TYPE_COMMAND         1
-#define HCI_V4L2_TYPE_ACL_DATA        2
-#define HCI_V4L2_TYPE_SCO_DATA        3
-#define HCI_V4L2_TYPE_EVENT           4
-#define HCI_V4L2_TYPE_FM_CMD          8
 
-
-/* Message event ID passed from stack to vendor lib */
-#define MSG_STACK_TO_HC_HCI_ACL        0x2100 /* eq. BT_EVT_TO_LM_HCI_ACL */
-#define MSG_STACK_TO_HC_HCI_SCO        0x2200 /* eq. BT_EVT_TO_LM_HCI_SCO */
-#define MSG_STACK_TO_HC_HCI_CMD        0x2000 /* eq. BT_EVT_TO_LM_HCI_CMD */
-#define MSG_FM_TO_HC_HCI_CMD           0x4000
-#define MSG_HC_TO_FM_HCI_EVT           0x3000
 
 /* struct to parse vendor params */
 typedef int (conf_action_t)(char *p_conf_name, char *p_conf_value);
@@ -150,12 +141,43 @@ typedef struct {
 } conf_entry_t;
 
 /*******************************************************************************
+**  Forward declaration
+*******************************************************************************/
+static long brcm_sh_ldisc_stop(struct hci_uart *hu, bool btsleep_open);
+static long brcm_sh_ldisc_start(struct hci_uart *hu);
+static struct sk_buff *brcm_sh_ldisc_write(struct sk_buff *skb, bool never_blocking);
+
+static int put_proto(struct hci_uart *hu, struct hci_uart_proto_desc *proto_desc);
+static struct hci_uart_proto_desc *get_proto(struct hci_uart *hu, struct hci_uart_proto_desc *proto_desc);
+
+static bool put_component_desc(struct hci_uart *hu, enum component_type comp_type);
+static struct component_desc *get_component_desc(struct hci_uart *hu, enum component_type comp_type);
+static int reset_component_desc(struct hci_uart *hu, struct component_interface *interface);
+
+static __u32 brcm_sh_ldisc_extract_hcicmd_sync_id(struct sk_buff *skb);
+
+/*******************************************************************************
 **  Local type definitions
 *******************************************************************************/
-spinlock_t  reg_lock;
+struct component_desc {
+    __u32 curr_sync_id;
+    struct sk_buff *curr_sync_response;
+
+    wait_queue_head_t sync_waiter;
+
+    __u32 ref_count;
+    struct component_interface *interface;
+};
+
+struct hci_uart_proto_desc {
+    struct hci_uart_proto *proto;
+
+    spinlock_t ref_count_lock;
+    unsigned int ref_count;
+};
+
 static int is_print_reg_error = 1;
 static unsigned long jiffi1, jiffi2;
-struct mutex cmd_credit;
 
 /* setting custom baudrate received from UIM */
 struct ktermios ktermios;
@@ -183,20 +205,18 @@ static enum sleep_type sleep = SLEEP_DEFAULT;
 
 struct sock *nl_sk_hcisnoop = NULL;
 static int hcisnoop_client_pid = 0;
-static struct nlmsghdr *nlh;
-static struct sk_buff *hcisnoop_skb_out;
 #endif
 
 /* HIC commands emitted by libbt which shall be ignored. */
 #define IGNORE_CMD_SIZE 14
-static const short IGNORE_CMDS[IGNORE_CMD_SIZE] =
+static const __u16 IGNORE_CMDS[IGNORE_CMD_SIZE] =
                                       {0x0c03, 0xfc45, 0xfc18, 0x0c14, 0xfc2e,
                                        0xfc01, 0xfc27, 0xfc1c, 0xfc1e, 0xfc6d,
                                        0xfc7e, 0xfc4e, 0x0c33, 0xfc4c};
 #define READ_CMD_DATA_LEN 33
 #define MAX_HCI_EVENT_LEN 37 // (+ 4 bytes header)
 
-static bool hci_filter_enabled = false;
+//static bool hci_filter_enabled = false;
 
 /*******************************************************************************
 **  Function forward-declarations and Function callback declarations
@@ -204,17 +224,17 @@ static bool hci_filter_enabled = false;
 
 static struct hci_uart_proto *hup[HCI_UART_MAX_PROTO];
 
-#define MAX_BRCM_DEVICES    3   /* Imagine 1 on each UART for now */
+//#define MAX_BRCM_DEVICES    3   /* Imagine 1 on each UART for now */
 
-static struct platform_device *brcm_plt_devices[MAX_BRCM_DEVICES];
+static struct platform_device *brcm_plt_device;
+#define HU_REF ((struct hci_uart *)dev_get_drvdata(&brcm_plt_device->dev))
 
 /**
   * internal functions to read chip name and
  * download patchram file
  */
 static long download_patchram(struct hci_uart*);
-static struct platform_device *ldisc_get_plat_device(int id);
-static int bcmbt_ldisc_remove(struct platform_device *pdev);
+static int brcm_ldisc_remove(struct platform_device *pdev);
 
 /********************************************************************/
 
@@ -222,6 +242,11 @@ static int bcmbt_ldisc_remove(struct platform_device *pdev);
 /*****************************************************************************
 **  Type definitions
 *****************************************************************************/
+
+static struct component_interface init_interface = {
+	.type = COMPONENT_BT,
+  .extract_sync_id = brcm_sh_ldisc_extract_hcicmd_sync_id
+};
 
 /* parsing functions */
 int parse_custom_baudrate(char *p_conf_name, char *p_conf_value)
@@ -244,7 +269,7 @@ int parse_LpmUseBluesleep(char *p_conf_name, char *p_conf_value)
     sscanf(p_conf_value, "%d", &LpmUseBluesleep);
     if( LpmUseBluesleep )
         sleep = SLEEP_BLUESLEEP;
-    BT_LDISC_DBG(V4L2_DBG_INIT, "%s sleep %d", __func__,sleep);
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "%s sleep %d", __func__,sleep);
     return 0;
 }
 
@@ -255,12 +280,14 @@ int parse_ControllerAddrRead(char *p_conf_name, char *p_conf_value)
     return 0;
 }
 
+#if V4L2_SNOOP_ENABLE
 int parse_ldisc_snoop_enable_param(char *p_conf_name, char *p_conf_value)
 {
     pr_info("%s = %s\n", p_conf_name, p_conf_value);
     sscanf(p_conf_value, "%d", &ldisc_snoop_enable_param);
     return 0;
 }
+#endif
 
 int parse_lpm_param(char *p_conf_name, char *p_conf_value)
 {
@@ -295,7 +322,9 @@ static const conf_entry_t conf_table[] = {
     {"patchram_settlement_delay", parse_patchram_settlement_delay, 0},
     {"LpmUseBluesleep", parse_LpmUseBluesleep, 0},
     {"ControllerAddrRead", parse_ControllerAddrRead, 0},
+#if V4L2_SNOOP_ENABLE
     {"ldisc_snoop_enable_param", parse_ldisc_snoop_enable_param, 0},
+#endif
     {"lpm_param" , parse_lpm_param, 0},
     {"ldisc_dbg_param",dbg_ldisc_drv},
     {"bt_dbg_param",dbg_bt_drv},
@@ -313,14 +342,14 @@ static void brcm_hcisnoop_recv_msg(struct sk_buff *skb)
     if(skb != NULL)
     {
         nlh = (struct nlmsghdr *)skb->data;
-        BT_LDISC_DBG(V4L2_DBG_TX,"hcisnoop: received read command from hcisnoop client: %s",\
+        BRCM_LDISC_DBG(V4L2_DBG_TX,"hcisnoop: received read command from hcisnoop client: %s",\
                                                        (char *)nlmsg_data(nlh));
         hcisnoop_client_pid = nlh->nlmsg_pid; /*pid of sending process */
-        BT_LDISC_DBG(V4L2_DBG_TX,"hcisnoop: accepting request from pid=%d",\
+        BRCM_LDISC_DBG(V4L2_DBG_TX,"hcisnoop: accepting request from pid=%d",\
                                                            hcisnoop_client_pid);
     }
     else {
-        BT_LDISC_ERR("skb is NULL");
+        BRCM_LDISC_ERR("skb is NULL");
     }
 
     return;
@@ -338,7 +367,7 @@ static int enable_snoop(void)
     if(ldisc_snoop_enable_param)
     {
         /* check whether snoop is enabled */
-        BT_LDISC_DBG(V4L2_DBG_TX, "ldisc_snoop_enable_param = %d",\
+        BRCM_LDISC_DBG(V4L2_DBG_TX, "ldisc_snoop_enable_param = %d",\
             ldisc_snoop_enable_param);
 
         /* close previously created socket */
@@ -357,7 +386,7 @@ static int enable_snoop(void)
 #endif
         if (!nl_sk_hcisnoop)
         {
-            BT_LDISC_ERR("Error creating netlink socket for HCI snoop");
+            BRCM_LDISC_ERR("Error creating netlink socket for HCI snoop");
             err = -10;
             return err;
         }
@@ -367,154 +396,15 @@ static int enable_snoop(void)
         return 0;
     }
 }
-
-/* Create netlink socket to snoop Line discipline driver from user space */
-int brcm_hci_snoop(struct hci_uart *hu, void* data, unsigned int count)
-{
-    int err=0;
-    unsigned long flags;
-    BT_LDISC_DBG(V4L2_DBG_TX , "brcm_hci_snoop");
-    /* Snoop and send data to hcidump */
-    if(hcisnoop_client_pid > 0)
-    {
-        spin_lock_irqsave(&hu->hcisnoop_lock, flags);
-        BT_LDISC_DBG(V4L2_DBG_TX , "Routing packet to hcisnoop"\
-            " client pid=%d data_len=%d", hcisnoop_client_pid, count);
-        /* Also route packet to hcisnoop client */
-        hcisnoop_skb_out = nlmsg_new(count, 0);
-
-        if (!hcisnoop_skb_out)
-        {
-            BT_LDISC_ERR("hcisnoop: Failed to allocate new skb");
-            spin_unlock_irqrestore(&hu->hcisnoop_lock, flags);
-            return -1;
-        }
-        nlh = nlmsg_put(hcisnoop_skb_out, 0, 0, NLMSG_DONE, count, 0);
-        NETLINK_CB(hcisnoop_skb_out).dst_group = 0; /* not in mcast group */
-        memcpy(nlmsg_data(nlh), (char *) data, count);
-
-        if(nl_sk_hcisnoop != NULL)
-        {
-            if ((err = nlmsg_unicast(nl_sk_hcisnoop, hcisnoop_skb_out,
-                    hcisnoop_client_pid)) < 0)
-            {
-                BT_LDISC_ERR("Error errcode=%d while sending packet to pid = %d",
-                    err, hcisnoop_client_pid);
-                hcisnoop_client_pid = 0;
-            }
-            else
-                BT_LDISC_DBG(V4L2_DBG_TX , "Forwarded hci packet"\
-                                                         "to hcisnoop client");
-        }
-        else {
-            BT_LDISC_ERR("nl_sk_hcisnoop == NULL");
-        }
-        spin_unlock_irqrestore(&hu->hcisnoop_lock, flags);
-    }
-
-    return 0;
-}
-
 #endif
-
-
-/* Function to abstract tty write. This will help in hci snooping both read and write packets */
-static int brcm_hci_write(struct hci_uart *hu, const unsigned char* data,
-                                                             unsigned int count)
-{
-    int len = 0;
-
-#if V4L2_SNOOP_ENABLE
-    if(nl_sk_hcisnoop)
-    {
-        unsigned long flags = 0;
-
-        hc_bt_hdr *hci_hdr;
-        uint8_t *p;
-
-        /* Snoop and send data to hcidump */
-        /* create header for snooping */
-        hci_hdr = (hc_bt_hdr *) hu->snoop_hdr_data;
-        if(hci_hdr != NULL)
-        {
-            hci_hdr->offset = 0;
-            hci_hdr->layer_specific = 0;
-            hci_hdr->len = count - 1;
-            BT_LDISC_DBG(V4L2_DBG_TX, "written values to hci_hdr");
-        }
-        else {
-            BT_LDISC_ERR("hci_hdr==NULL");
-            return -1;
-        }
-
-        /* write to tty->write for download patchram HCI commands */
-        if(hu->protos_registered == LDISC_EMPTY)
-        {
-            BT_LDISC_DBG(V4L2_DBG_TX, "writing to tty->write and snoop tx during"\
-                "download patchram");
-            spin_lock_irqsave(&hu->hcisnoop_write_lock, flags);
-            len = hu->tty->ops->write(hu->tty, data, count);
-            spin_unlock_irqrestore(&hu->hcisnoop_write_lock, flags);
-        }
-        else
-        {
-            BT_LDISC_DBG(V4L2_DBG_TX,"snoop tx from registered driver");
-        }
-
-        switch(data[0])
-        {
-                /* Construct header for sent packet */
-                case HCI_V4L2_TYPE_COMMAND:
-                    BT_LDISC_DBG(V4L2_DBG_TX, "HCI_V4L2_TYPE_COMMAND");
-                    hci_hdr->event = MSG_STACK_TO_HC_HCI_CMD;
-                    break;
-                case HCI_V4L2_TYPE_ACL_DATA:
-                    BT_LDISC_DBG(V4L2_DBG_TX, "HCI_V4L2_TYPE_ACL_DATA");
-                    hci_hdr->event = MSG_STACK_TO_HC_HCI_ACL;
-                    break;
-                case HCI_V4L2_TYPE_SCO_DATA:
-                    BT_LDISC_DBG(V4L2_DBG_TX, "HCI_V4L2_TYPE_SCO_DATA");
-                    hci_hdr->event = MSG_STACK_TO_HC_HCI_SCO;
-                    break;
-                case HCI_V4L2_TYPE_FM_CMD:
-                    BT_LDISC_DBG(V4L2_DBG_TX, "HCI_V4L2_TYPE_FM_CMD");
-                    hci_hdr->event = MSG_FM_TO_HC_HCI_CMD;
-                    break;
-                default:
-                    BT_LDISC_ERR("Unknown event for received packet event "\
-                        "= 0x%02X", data[0]);
-                    return count;
-                    break;
-        }
-
-        /* Hack to adjust layer_specific. Copy first 2 bytes of payload to layer_specific*/
-        memcpy(&hci_hdr->layer_specific, (uint8_t *)data + 1, 2);
-
-        /* Add HCI header */
-        p = (uint8_t *)(hci_hdr + 1);
-        /* Add payload */
-        memcpy(p, ((unsigned char *)data) + 1, count-1);
-        BT_LDISC_DBG(V4L2_DBG_TX, "Calling brcm_hci_snoop from brcm_hci_write");
-
-        brcm_hci_snoop(hu, hci_hdr, sizeof(hc_bt_hdr) + count - 1);
-    }
-    else
-#endif
-    {
-        len = hu->tty->ops->write(hu->tty, data, count);
-    }
-    return len;
-
-}
 
 /* parse and load vendor params */
 static int parse_vendor_params(void)
 {
-    struct hci_uart *hu;
+    struct hci_uart *hu = HU_REF;
     conf_entry_t *p_entry;
     char *p;
     char *p_name, *p_value;
-    hu_ref(&hu, 0);
 
     p = hu->vendor_params;
     pr_info("parse_vendor_params = %s", hu->vendor_params);
@@ -547,12 +437,10 @@ static ssize_t show_install(struct device *dev,
 static ssize_t store_install(struct device *dev,
         struct device_attribute *attr, char *buf,size_t size)
 {
-    unsigned long flags = 0;
-    struct hci_uart *hu;
-    hu_ref(&hu, 0);
+    struct hci_uart *hu = HU_REF;
 
     // Avoid race condition if all app (BT/FM/Ant) simultaneously try to write to install entry
-    spin_lock_irqsave(&hu->err_lock, flags);
+    spin_lock(&hu->err_lock);
 
     /* When HCI command timeout or hardware error event occurs in an application,
     * BT/FM/Ant apps should set a value 0x02 to "install sysfs" entry. Ldisc will set
@@ -571,10 +459,10 @@ static ssize_t store_install(struct device *dev,
         sysfs_notify(&hu->brcm_pdev->dev.kobj, NULL, "install");
         sysfs_notify(&hu->brcm_pdev->dev.kobj, NULL, "bt_err");
         sysfs_notify(&hu->brcm_pdev->dev.kobj, NULL, "fm_err");
-        BT_LDISC_ERR("Error!: Userspace app has reported error. install = %c",\
+        BRCM_LDISC_ERR("Error!: Userspace app has reported error. install = %c",\
             buf[0]);
     }
-    spin_unlock_irqrestore(&hu->err_lock, flags);
+    spin_unlock(&hu->err_lock);
     return size;
 }
 
@@ -589,8 +477,7 @@ static ssize_t show_bt_err(struct device *dev,
 static ssize_t store_bt_err(struct device *dev,
         struct device_attribute *attr, char *buf,size_t size)
 {
-    struct hci_uart *hu;
-    hu_ref(&hu, 0);
+    struct hci_uart *hu = HU_REF;
     hu->ldisc_bt_err = buf[0];
     return size;
 }
@@ -606,8 +493,7 @@ static ssize_t show_fm_err(struct device *dev,
 static ssize_t store_fm_err(struct device *dev,
         struct device_attribute *attr, char *buf,size_t size)
 {
-    struct hci_uart *hu;
-    hu_ref(&hu, 0);
+    struct hci_uart *hu = HU_REF;
     hu->ldisc_fm_err = buf[0];
 
     return size;
@@ -624,16 +510,17 @@ static ssize_t show_vendor_params(struct device *dev,
 static ssize_t store_vendor_params(struct device *dev,
         struct device_attribute *attr, char *buf,size_t size)
 {
-    struct hci_uart *hu;
-    hu_ref(&hu, 0);
+    struct hci_uart *hu = HU_REF;
     memcpy(hu->vendor_params, buf, VENDOR_PARAMS_LEN);
     parse_vendor_params();
 
+#if V4L2_SNOOP_ENABLE
     // enable/disable snoop
     if(enable_snoop()!=0)
     {
-        BT_LDISC_ERR("Unable to enable HCI snoop in ldisc");
+        BRCM_LDISC_ERR("Unable to enable HCI snoop in ldisc");
     }
+#endif
 
     return size;
 }
@@ -658,7 +545,7 @@ static ssize_t store_fw_patchfile(struct device *dev,
         struct device_attribute *attr, char *buf,size_t size)
 {
     sprintf(fw_name, "%s",buf);
-    BT_LDISC_DBG(V4L2_DBG_INIT,"store_fw_patchfile  %s size %d ",fw_name,size);
+    BRCM_LDISC_DBG(V4L2_DBG_INIT,"store_fw_patchfile  %s size %d ",fw_name,size);
     return size;
 }
 
@@ -691,16 +578,16 @@ static ssize_t store_snoop_enable(struct device *dev,
 #endif
             if (!nl_sk_hcisnoop)
             {
-                BT_LDISC_ERR("Error creating netlink socket for HCI snoop");
+                BRCM_LDISC_ERR("Error creating netlink socket for HCI snoop");
             }
-            BT_LDISC_DBG(V4L2_DBG_TX, "enabling HCI snoop");
+            BRCM_LDISC_DBG(V4L2_DBG_TX, "enabling HCI snoop");
         }
         else {
             /* stop hci snoop to hcidump */
             if(nl_sk_hcisnoop)
                 netlink_kernel_release(nl_sk_hcisnoop);
             nl_sk_hcisnoop = NULL;
-            BT_LDISC_DBG(V4L2_DBG_TX, "disabling HCI snoop");
+            BRCM_LDISC_DBG(V4L2_DBG_TX, "disabling HCI snoop");
         }
     }
 
@@ -756,32 +643,7 @@ static struct attribute_group uim_attr_grp = {
 };
 
 
-static void add_channel_to_table(struct hci_uart*hu,
-        struct sh_proto_s *new_proto)
-{
-    BT_LDISC_DBG(V4L2_DBG_INIT, "id %d\n", new_proto->type);
 
-    /* list now has the channel id as index itself */
-    hu->list[new_proto->type] = new_proto;
-    hu->list[new_proto->type]->priv_data = new_proto->priv_data;
-    hu->is_registered[new_proto->type] = true;
-}
-
-static void remove_channel_from_table(struct hci_uart*hu,
-        enum proto_type proto)
-{
-    BT_LDISC_DBG(V4L2_DBG_INIT, "id %d\n", proto);
-    hu->list[proto] = NULL;
-    hu->is_registered[proto] = false;
-}
-
-/* to signal completion of line discipline installation
- */
-void sh_ldisc_complete(void *sh_data)
-{
-    struct hci_uart*sh_gdata = (struct hci_uart*)sh_data;
-    complete(&sh_gdata->ldisc_installed);
-}
 
 
 /*******************************************************************************
@@ -790,24 +652,226 @@ void sh_ldisc_complete(void *sh_data)
 
 /*******************************************************************************
 **
+** Function - brcm_hci_tty_op_write()
+**
+** Description - Writing data bytes to tty
+**
+** Returns - 0 if success; a negative errno otherwise
+**
+*******************************************************************************/
+static int brcm_hci_tty_op_write(struct hci_uart *hu, const unsigned char* data,
+                                                             unsigned int count)
+{
+    int written_len = 0;
+    int remaining_len = count;
+
+
+    while (remaining_len > 0) {
+        written_len = hu->tty->ops->write(hu->tty, data, remaining_len);
+        if (written_len < 0) {
+            return -EIO;
+        }
+
+        data += written_len;
+        remaining_len -= written_len;
+    }
+
+    if (remaining_len < 0) {
+        return -EIO;
+    } else {
+        return count - remaining_len;
+    }
+}
+
+/*******************************************************************************
+**
+** Function - brcm_hci_queue_tx()
+**
+** Description - Queuing a skb for tx transmission
+**
+** Returns - when in blocking mode
+**             A sk_buff pointer to the response if success; an error ptr otherwise
+**         - when not in blocking mode
+**             NULL if success; an error ptr otherwise
+**
+*******************************************************************************/
+static struct sk_buff *brcm_hci_queue_tx(struct hci_uart *hu, struct sk_buff *skb, bool never_blocking)
+{
+    bool wait_for_response = false;
+    struct hci_uart_proto_desc *proto_desc = NULL;
+    struct component_desc *comp_desc = NULL;
+    int ret = 0, err;
+    struct sk_buff *response = NULL;
+    __u32 sync_id = 0;
+
+    if (unlikely(!hu))
+        return ERR_PTR(-EFAULT);
+
+    proto_desc = get_proto(hu, NULL);
+    if (unlikely(IS_ERR_OR_NULL(proto_desc))) {
+        return ERR_PTR(-EFAULT);
+    }
+
+    if (!never_blocking) {
+        comp_desc = get_component_desc(hu, sh_ldisc_cb(skb)->comp_type);
+
+        if (comp_desc && comp_desc->interface->extract_sync_id)
+            sync_id = comp_desc->interface->extract_sync_id(skb);
+
+
+        if (sync_id) {
+            wait_for_response = true;
+            spin_lock(&comp_desc->sync_waiter.lock);
+            comp_desc->curr_sync_id = sync_id;
+            comp_desc->curr_sync_response = NULL;
+            spin_unlock(&comp_desc->sync_waiter.lock);
+        } else {
+            BRCM_LDISC_DBG(V4L2_DBG_TX, "Failed to extract a valid sync_id; no response synchronisation");
+        }
+    }
+
+    /* Note: enqueue() will always take over the ownership of skb */
+    err = proto_desc->proto->enqueue(hu, skb);
+    put_proto(hu, proto_desc);
+    if (err) {
+
+        BRCM_LDISC_ERR("An error occured while doing enqueue(): err = %d", err);
+        goto out;
+    }
+
+    queue_work(hu->tx_wq, &hu->tx_work);
+
+    if (wait_for_response) {
+        unsigned long completed = 0;
+        /* comp_desc can not be null in this case */
+
+        spin_lock(&comp_desc->sync_waiter.lock);
+        completed = wait_event_locked_timeout(
+                comp_desc->sync_waiter,
+                comp_desc->curr_sync_response,
+                msecs_to_jiffies(HCI_RESP_TIME));
+        response = comp_desc->curr_sync_response;
+        comp_desc->curr_sync_response = NULL;
+        comp_desc->curr_sync_id = 0;
+        spin_unlock(&comp_desc->sync_waiter.lock);
+
+        wait_for_response = false;
+
+        if (!completed) {
+            BRCM_LDISC_ERR("Timeout while waiting for a response; continuing");
+        }
+    }
+
+out:
+    if (comp_desc) {
+
+        if (wait_for_response) {
+            spin_lock(&comp_desc->sync_waiter.lock);
+            comp_desc->curr_sync_response = NULL;
+            comp_desc->curr_sync_id = 0;
+            spin_unlock(&comp_desc->sync_waiter.lock);
+        }
+
+        put_component_desc(hu, comp_desc->interface->type);
+    }
+
+    return response;
+}
+
+/*******************************************************************************
+**
+** Function - brcm_hci_snoop_send()
+**
+** Description - Sending snooping packets
+**
+** Returns - 0 if success; a negative errno otherwise
+**
+*******************************************************************************/
+#if V4L2_SNOOP_ENABLE
+int brcm_hci_snoop_send(struct hci_uart *hu, struct hci_snoop_hdr *snoop_hdr, const unsigned char* data, unsigned int log_flag)
+{
+    int err=0;
+    unsigned long flags;
+		struct nlmsghdr *nlh;
+		struct sk_buff *hcisnoop_skb_out;
+		void *msg_ptr;
+		unsigned int count = sizeof(struct hci_snoop_hdr) + snoop_hdr->len;
+
+    BRCM_LDISC_DBG(log_flag , "brcm_hci_snoop");
+    /* Snoop and send data to hcidump */
+    if(hcisnoop_client_pid > 0)
+    {
+        spin_lock_irqsave(&hu->hcisnoop_lock, flags);
+        if (nl_sk_hcisnoop) {
+
+            BRCM_LDISC_DBG(log_flag, "Routing packet to hcisnoop"\
+                " client pid=%d count=%d", hcisnoop_client_pid, count);
+            /* Also route packet to hcisnoop client */
+            hcisnoop_skb_out = nlmsg_new(count, 0);
+
+            if (!hcisnoop_skb_out)
+            {
+                BRCM_LDISC_ERR("hcisnoop: Failed to allocate new skb");
+                spin_unlock_irqrestore(&hu->hcisnoop_lock, flags);
+                return -1;
+            }
+            nlh = nlmsg_put(hcisnoop_skb_out, 0, 0, NLMSG_DONE, count, 0);
+            NETLINK_CB(hcisnoop_skb_out).dst_group = 0; /* not in mcast group */
+                    msg_ptr = nlmsg_data(nlh);
+            memcpy(msg_ptr, snoop_hdr, sizeof(struct hci_snoop_hdr));
+            memcpy(msg_ptr+sizeof(struct hci_snoop_hdr), data, snoop_hdr->len);
+
+            if ((err = nlmsg_unicast(nl_sk_hcisnoop, hcisnoop_skb_out,
+                    hcisnoop_client_pid)) < 0)
+            {
+                BRCM_LDISC_ERR("Error errcode=%d while sending packet to pid = %d",
+                    err, hcisnoop_client_pid);
+                hcisnoop_client_pid = 0;
+            }
+            else
+                BRCM_LDISC_DBG(log_flag, "Forwarded hci packet"\
+                                                         "to hcisnoop client");
+        }
+        spin_unlock_irqrestore(&hu->hcisnoop_lock, flags);
+    }
+
+    return 0;
+}
+#endif
+
+/*******************************************************************************
+**
 ** Function - brcm_hci_uart_register_proto()
 **
 ** Description - Used by the lower layer to register UART protocol
-**             which can be H4, LL, BCSP etc
+**             which can be H4, LL, BCSP etc.
+**             This should only be called during initialisation where
+**             registration of various protos is performed sequentially
 **
 ** Returns - 0 if success; errno otherwise
 **
 *******************************************************************************/
 int brcm_hci_uart_register_proto(struct hci_uart_proto *p)
 {
+    struct hci_uart_proto_desc *proto_desc;
+
     if (p->id >= HCI_UART_MAX_PROTO)
         return -EINVAL;
 
     if (hup[p->id])
         return -EEXIST;
 
-    hup[p->id] = p;
-    BT_LDISC_DBG(V4L2_DBG_INIT, "%p", p);
+    proto_desc = kzalloc(sizeof(struct hci_uart_proto_desc), GFP_KERNEL);
+
+    if (!proto_desc)
+        return -ENOMEM;
+
+    proto_desc->proto = p;
+    spin_lock_init(&proto_desc->ref_count_lock);
+
+    hup[p->id] = proto_desc;
+
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "%p", p);
 
     return 0;
 }
@@ -817,20 +881,31 @@ int brcm_hci_uart_register_proto(struct hci_uart_proto *p)
 ** Function - brcm_hci_uart_unregister_proto()
 **
 ** Description - Used by the lower layer to unregister UART protocol
-**             which can be H4, LL, BCSP etc
+**             which can be H4, LL, BCSP etc.
+**             This should only be called during deinitialisation
+**             where unregistration of various protos is performed
+**             sequentially
 **
 ** Returns - 0 if success; errno otherwise
 **
 *******************************************************************************/
 int brcm_hci_uart_unregister_proto(struct hci_uart_proto *p)
 {
+    struct hci_uart_proto_desc *proto_desc;
+
     if (p->id >= HCI_UART_MAX_PROTO)
         return -EINVAL;
 
-    if (!hup[p->id])
+    proto_desc = hup[p->id];
+    if (!proto_desc)
         return -EINVAL;
+    else {
+        if (proto_desc->proto != p)
+            return -EINVAL;
 
-    hup[p->id] = NULL;
+        kfree(proto_desc);
+        hup[p->id] = NULL;
+    }
 
     return 0;
 }
@@ -845,140 +920,249 @@ int brcm_hci_uart_unregister_proto(struct hci_uart_proto *p)
 ** Returns - 0 if success; errno otherwise
 **
 *******************************************************************************/
-void brcm_hci_uart_route_frame(enum proto_type protoid, struct hci_uart *hu,
-                    struct sk_buff *skb)
+void brcm_hci_uart_route_frame(struct hci_uart *hu, enum component_type comp_type, struct sk_buff *skb)
 {
-    BT_LDISC_DBG(V4L2_DBG_RX, " (prot:%d) ", protoid);
+    struct component_desc *comp_desc = NULL;
+    __u32 sync_id = 0;
 
-#if V4L2_SNOOP_ENABLE
-    if(nl_sk_hcisnoop)
-    {
-        if (!(hu->is_registered[PROTO_SH_ANT] || hu->is_registered[PROTO_SH_FM])
-           || (skb->data)[11] != 0x03 || (skb->data)[12] != 0x0c)
-        {
-            /* forward to hcisnoop */
-            BT_LDISC_DBG(V4L2_DBG_RX, "capturing snoop skb->len=%d", skb->len);
-            brcm_hci_snoop(hu, skb->data, skb->len);
+    BRCM_LDISC_DBG(V4L2_DBG_RX, "comp_type = %d", comp_type);
 
-            /* Remove hci header used for HCI snoop, before sending to fmdrv */
-            if(protoid == PROTO_SH_FM) {
-                skb_pull(skb, sizeof(hc_bt_hdr));
+    if (unlikely(!hu || !skb)) {
+        BRCM_LDISC_ERR("hci_uart or skb ptr is null");
+        goto out;
+    }
+
+
+    comp_desc = get_component_desc(hu, comp_type);
+
+    if (likely(comp_desc)) {
+        if (comp_desc->interface->extract_sync_id) {
+            sync_id = comp_desc->interface->extract_sync_id(skb);
+            if (sync_id) {
+                spin_lock(&comp_desc->sync_waiter.lock);
+                if (comp_desc->curr_sync_id == sync_id) {
+                    comp_desc->curr_sync_response = skb_get(skb);
+                    comp_desc->curr_sync_id = 0;
+                    wake_up_locked(&comp_desc->sync_waiter);
+                }
+
+                spin_unlock(&comp_desc->sync_waiter.lock);
+
             }
         }
-    }
-#endif
 
-    /* Remove hci header used for HCI snoop, before sending to btdrv */
-    if(protoid == PROTO_SH_BT) {
-        char type = sh_ldisc_cb(skb)->pkt_type;
-        skb_pull(skb, sizeof(hc_bt_hdr));
-        memcpy(skb_push(skb, sizeof(char)),&type, sizeof(char));
-    }
 
-    if(mutex_is_locked(&cmd_credit))
-    {
-        if(protoid == PROTO_SH_BT)
-        {
-            if((skb->data[1]==0x0e && skb->data[3]==0x01) ||  // command_complete evt with hci_credit=1
-               (skb->data[1]==0x0f && skb->data[4]==0x01))    // command_status evt with hci_credit=1
-            {
-                complete_all(&hu->cmd_rcvd);
-            }
+        if (likely(comp_desc->interface->recv)) {
+            long ret = comp_desc->interface->recv(skb);
+            if (unlikely(ret)) {
+                BRCM_LDISC_ERR(" component %d's recv() failed with ret = %d", comp_desc->interface->type, ret);
+            } else
+                skb = NULL;
+
+        } else {
+            BRCM_LDISC_DBG(V4L2_DBG_RX, "component %d does not provide recv() for handling its rx data; skb dropped", comp_desc->interface->type);
         }
-        else if(protoid == PROTO_SH_FM || protoid == PROTO_SH_ANT)
-        {
-            if((skb->data[0]==0x0e && skb->data[2]==0x01) ||  // command_complete evt with hci_credit=1
-               (skb->data[0]==0x0f && skb->data[3]==0x01))    // command_status evt with hci_credit=1
-            {
-                complete_all(&hu->cmd_rcvd);
-            }
-        }
+
+        put_component_desc(hu, comp_desc->interface->type);
+    } else {
+        BRCM_LDISC_DBG(V4L2_DBG_RX, "component %d does not register to this ldisc; skb dropped", comp_type);
     }
 
-    if (unlikely
-            (hu == NULL || skb == NULL
-                || hu->list[protoid] == NULL))
-    {
-        BT_LDISC_ERR("protocol %d not registered, no data to send?",
-                            protoid);
-        if (hu != NULL && skb != NULL)
-            kfree_skb(skb);
-
-        return;
-    }
-  /* this cannot fail. This shouldn't take long. Should be just skb_queue_tail for the
-    *   protocol stack driver
-    */
-    if (likely(hu->list[protoid]->recv != NULL))
-    {
-        if (unlikely
-        (hu->list[protoid]->recv
-        (hu->list[protoid]->priv_data, skb)
-        != 0))
-        {
-            BT_LDISC_ERR(" proto stack %d's ->recv failed", protoid);
-            kfree_skb(skb);
-            return;
-        }
-    }
-    else
-    {
-        BT_LDISC_ERR(" proto stack %d's ->recv null", protoid);
+out:
+    if (skb)
         kfree_skb(skb);
-    }
+
     return;
+}
+
+
+
+/*******************************************************************************
+**
+** Function - put_proto()
+**
+** Description - Decreasing by 1 the reference count of the designated
+**             UART Protocol, which can be H4, LL, BCSP etc,
+**             and calling its close() when the ref_count drops to 0
+**
+** Returns - 0 if successful, a negative errno otherwise
+**
+*******************************************************************************/
+static int put_proto(struct hci_uart *hu, struct hci_uart_proto_desc *proto_desc)
+{
+    int err = 0;
+
+    if (!proto_desc) {
+        proto_desc = hu->curr_proto_desc;
+
+        if (!proto_desc)
+            return -EINVAL;
+    }
+
+    spin_lock(&proto_desc->ref_count_lock);
+    if (proto_desc->ref_count == 1) {
+        proto_desc->ref_count = 0;
+        err = proto_desc->proto->close(hu);
+    } else if (proto_desc->ref_count > 1){
+        proto_desc->ref_count -= 1;
+    }
+    spin_unlock(&proto_desc->ref_count_lock);
+
+
+    return err;
 }
 
 /*******************************************************************************
 **
-** Function - brcm_hci_uart_get_proto()
+** Function - get_proto()
 **
-** Description - Function to get the registered UART Protocol
-**             which can be H4, LL, BCSP etc
+** Description - Increasing by 1 the reference count of the designated
+**             UART Protocol, which can be H4, LL, BCSP etc,
+**             and calling its open() when ref_count changes from 0 to 1
 **
 ** Returns - Pointer to struct hci_uart_proto
 **
 *******************************************************************************/
-static struct hci_uart_proto *brcm_hci_uart_get_proto(unsigned int id)
+static struct hci_uart_proto_desc *get_proto(struct hci_uart *hu, struct hci_uart_proto_desc *proto_desc)
 {
-    if (id >= HCI_UART_MAX_PROTO)
-        return NULL;
+    int err = 0;
 
-    return hup[id];
+    if (!proto_desc) {
+        proto_desc = hu->curr_proto_desc;
+
+        if (!proto_desc)
+            return ERR_PTR(-EFAULT);
+    }
+
+
+    spin_lock(&proto_desc->ref_count_lock);
+    if (!proto_desc->ref_count) {
+        err = proto_desc->proto->open(hu);
+    }
+    if (!err)
+        proto_desc->ref_count += 1;
+    spin_unlock(&proto_desc->ref_count_lock);
+
+    if (err)
+        return ERR_PTR(err);
+    else
+        return proto_desc;
 }
 
 /*******************************************************************************
 **
-** Function - brcm_hci_uart_set_proto()
+** Function - put_component_desc()
 **
-** Description - Function to register the UART Protocol
+** Description - Decreasing by 1 the reference count of the designated component descriptor,
+**             which can be BT, FM, GPS etc, and deleting it when the ref_count drops to 0
 **
-** Returns - 0 if success; errno otherwise
+** Returns - true if reference drop indeed happens, false otherwise
 **
 *******************************************************************************/
-static int brcm_hci_uart_set_proto(struct hci_uart *hu, int id)
+static bool put_component_desc(struct hci_uart *hu, enum component_type comp_type)
 {
-    struct hci_uart_proto *p;
-    int err;
+    struct component_desc *comp_desc = NULL;
+    bool put = false;
 
-    p = brcm_hci_uart_get_proto(id);
-    if (!p)
-        return -EPROTONOSUPPORT;
+    spin_lock(&hu->component_descs_lock);
+    comp_desc = hu->component_descs[comp_type];
+    if (comp_desc) {
+        if (comp_desc->ref_count == 1)
+            hu->component_descs[comp_type] = NULL;
+        else {
+            comp_desc->ref_count -= 1;
+            comp_desc = NULL;
+        }
+        put = true;
+    }
+    spin_unlock(&hu->component_descs_lock);
 
-    err = p->open(hu);
-    if (err)
-        return err;
+    if (comp_desc) {
+        kfree(comp_desc);
+    }
 
-    hu->proto = p;
-    BT_LDISC_DBG(V4L2_DBG_INIT, "%p", p);
-    return 0;
+    return put;
 }
 
 /*******************************************************************************
 **
-** Function - brcm_hci_uart_set_proto()
+** Function - get_component_desc()
 **
-** Description - Called upon TX completion, prints packet type for debugging
+** Description - Increasing by 1 the reference count of the descriptor of the given
+**             component type, which can be BT, FM, GPS etc, and returning
+**             that descriptor pointer (if exists)
+**
+** Returns - The descriptor pointer of the given type if exists, NULL otherwise
+**
+*******************************************************************************/
+static struct component_desc *get_component_desc(struct hci_uart *hu, enum component_type comp_type)
+{
+    struct component_desc *comp_desc = NULL;
+
+    spin_lock(&hu->component_descs_lock);
+    comp_desc = hu->component_descs[comp_type];
+    if (comp_desc) {
+        comp_desc->ref_count += 1;
+    }
+    spin_unlock(&hu->component_descs_lock);
+
+    return comp_desc;
+}
+
+/*******************************************************************************
+**
+** Function - reset_component_desc()
+**
+** Description - Creating a new component descriptor keeping the given interface
+**             of some component type, which can be BT, FM, GPS etc, with its
+**             initial reference count equal to 1
+**
+** Returns - 0 if successful, a negative errno otherwise
+**
+*******************************************************************************/
+static int reset_component_desc(struct hci_uart *hu, struct component_interface *interface)
+{
+    int ret = 0;
+    struct component_desc *removed_desc = NULL;
+    struct component_desc *new_desc = kzalloc(sizeof(struct component_desc), GFP_KERNEL);
+
+    if (!new_desc) {
+        BRCM_LDISC_ERR("Failed to allocate memory for comp_desc %d", interface->type);
+        return -ENOMEM;
+    }
+
+    init_waitqueue_head(&new_desc->sync_waiter);
+    new_desc->ref_count = 1;
+    new_desc->interface = interface;
+
+    spin_lock(&hu->component_descs_lock);
+    removed_desc = hu->component_descs[interface->type];
+    if (removed_desc) {
+        if (removed_desc->ref_count > 1) {
+            removed_desc = new_desc;
+        } else {
+            hu->component_descs[interface->type] = new_desc;
+        }
+    } else {
+        hu->component_descs[interface->type] = new_desc;
+    }
+    spin_unlock(&hu->component_descs_lock);
+
+    if (removed_desc == new_desc)
+        ret = -EBUSY;
+
+    if (removed_desc)
+        kfree(removed_desc);
+
+    return ret;
+}
+
+
+/*******************************************************************************
+**
+** Function - brcm_hci_uart_tx_complete()
+**
+** Description - Called upon TX completion to print packet type for the debugging
 **               purposes
 **
 ** Returns - void
@@ -991,94 +1175,109 @@ static inline void brcm_hci_uart_tx_complete(struct hci_uart *hu,
     switch (pkt_type)
     {
         case HCI_COMMAND_PKT:
-            BT_LDISC_DBG(V4L2_DBG_TX, "HCI command packet txed");
+            BRCM_LDISC_DBG(V4L2_DBG_TX, "HCI command packet txed");
             break;
 
         case HCI_ACLDATA_PKT:
-            BT_LDISC_DBG(V4L2_DBG_TX, "HCI ACL DATA packet txed");
+            BRCM_LDISC_DBG(V4L2_DBG_TX, "HCI ACL DATA packet txed");
             break;
 
         case HCI_SCODATA_PKT:
-            BT_LDISC_DBG(V4L2_DBG_TX ,"HCI SCO DATA packet txed");
+            BRCM_LDISC_DBG(V4L2_DBG_TX ,"HCI SCO DATA packet txed");
             break;
     }
 }
 
+
 /*******************************************************************************
 **
-** Function - brcm_hci_uart_dequeue()
+** Function - brcm_hci_uart_tx_work_handler()
 **
-** Description - Function to dequeue SKB from the protocol queue
+** Description - The tx work handler called by kernel workqueue infrastructure to
+**             dequeue data and write them to tty
 **
-** Returns - Pointer to struct sk_buff
+** Returns - none
 **
 *******************************************************************************/
-static inline struct sk_buff *brcm_hci_uart_dequeue(struct hci_uart *hu)
-{
-    struct sk_buff *skb = hu->tx_skb;
+static void brcm_hci_uart_tx_work_handler(struct work_struct *w) {
 
-    if (!skb)
-        skb = hu->proto->dequeue(hu);
-    else
-        hu->tx_skb = NULL;
+    struct hci_uart *hu = container_of(w, struct hci_uart, tx_work);
+    struct hci_uart_proto_desc *proto_desc;
+    struct sk_buff *skb = NULL;
+    bool first = true;
 
-    return skb;
+    while (hu->tx_on) {
+
+        proto_desc = get_proto(hu, NULL);
+        if (unlikely(IS_ERR_OR_NULL(proto_desc)))
+            break;
+
+        skb = proto_desc->proto->dequeue(hu);
+        put_proto(hu, proto_desc);
+
+
+        if (!skb)
+            break;
+
+        if (first) {
+            /* If this is the first time entering this loop,
+             * making sure the hardware gets woken up before writing
+             */
+            brcm_btsleep_wake(sleep);
+            first = false;
+        }
+
+        brcm_hci_tty_op_write(hu, skb->data, skb->len);
+
+        kfree_skb(skb);
+
+    }
+
 }
 
 /*******************************************************************************
 **
-** Function - brcm_hci_uart_tx_wakeup()
+** Function - send_hci_pkt_internal()
 **
-** Description - Function to dequeue data and write data
-**               to UART driver
+** Description - A helper to put raw data into a sk_buff packet and conduct tx transmission
+**             in the blocking mode
 **
-** Returns - Pointer to struct sk_buff
+** Returns - when deleting_resp is false
+**              A sk_buff pointer to the response if successful; an error ptr otherwise
+**           when deleting_resp is true
+**              NULL if successful; an error ptr otherwise
 **
 *******************************************************************************/
-int brcm_hci_uart_tx_wakeup(struct hci_uart *hu)
+static struct sk_buff *send_hci_pkt_internal(struct hci_uart *hu, const unsigned char *data, int size, bool deleting_resp)
 {
-    struct tty_struct *tty = hu->tty;
-    struct sk_buff *skb;
-    unsigned long lock_flags;
-    bool wakeup = true;
-    if (test_and_set_bit(HCI_UART_SENDING, &hu->tx_state))
-    {
-        set_bit(HCI_UART_TX_WAKEUP, &hu->tx_state);
-        return 0;
+    int ret = 0;
+    struct sk_buff *skb, *response = NULL;
+    //		bool sync = false;
+    //		struct response_sync resp_sync = {0};
+
+    skb = alloc_skb(size, GFP_KERNEL);
+    if (!skb)
+        return ERR_PTR(-ENOMEM);
+
+    memcpy(skb_put(skb, size), data, size);
+    sh_ldisc_cb(skb)->comp_type = COMPONENT_BT;
+
+    response = brcm_hci_queue_tx(hu, skb, false /*never_blocking*/);
+
+    if (IS_ERR(response)) {
+        kfree_skb(skb);
+
+    } else {
+        // Note that even in this case where the skb has been sent successfully,
+        // response could also be null due to timeout or being associated with a type not supporting the sync mode
+        if (deleting_resp && response) {
+            kfree_skb(response);
+            response = NULL;
+        }
+
     }
 
-    do{
-        clear_bit(HCI_UART_TX_WAKEUP, &hu->tx_state);
-
-        while ((skb = brcm_hci_uart_dequeue(hu))) {
-            int len;
-            if (wakeup) {
-                BT_LDISC_DBG(V4L2_DBG_TX, "hci_uart_tx_wakeup");
-                brcm_btsleep_wake(sleep);
-                wakeup = false;
-            }
-
-            spin_lock_irqsave(&hu->lock, lock_flags);
-
-            len = tty->ops->write(tty, skb->data, skb->len);
-
-            skb_pull(skb, len);
-            if (skb->len)
-            {
-                hu->tx_skb = skb;
-                set_bit(HCI_UART_TX_WAKEUP, &hu->tx_state);
-                spin_unlock_irqrestore(&hu->lock, lock_flags);
-                break;
-            }
-
-            brcm_hci_uart_tx_complete(hu, sh_ldisc_cb(skb)->pkt_type);
-            kfree_skb(skb);
-            spin_unlock_irqrestore(&hu->lock, lock_flags);
-        }
-    }while(test_bit(HCI_UART_TX_WAKEUP, &hu->tx_state));
-
-    clear_bit(HCI_UART_SENDING, &hu->tx_state);
-    return 0;
+    return response;
 }
 
 
@@ -1091,43 +1290,52 @@ int brcm_hci_uart_tx_wakeup(struct hci_uart *hu)
 ** Returns - 0 if success; errno otherwise
 **
 *******************************************************************************/
-
 int brcm_sh_ldisc_lpm_disable(struct hci_uart *hu)
 {
-    const char hci_lpm_disable_cmd[] = {0x01,0x27,0xfc,0x0c,0x00,0x00,0x00,0x00,\
+    const char hci_lpm_disable_cmd[] = {0x01,0x27,0xfc,0x0c,0x00,0x00,0x00,0x00,
                                         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
 
+    int ret = 0;
+
     /* Perform LPM disable  */
-    brcm_hci_write(hu, hci_lpm_disable_cmd, 16);
-    if (!wait_for_completion_timeout
-          (&hu->cmd_rcvd, msecs_to_jiffies(CMD_RESP_TIME))) {
-            BT_LDISC_ERR(" waiting for set LPM disable. Command response timed out");
-            return -ETIMEDOUT;
+    ret = PTR_ERR(send_hci_pkt_internal(hu, hci_lpm_disable_cmd, sizeof(hci_lpm_disable_cmd), true));
+
+    if (ret) {
+        BRCM_LDISC_ERR("An error (%d) occurred while disabling LPM", ret);
+    } else {
+        BRCM_LDISC_DBG(V4L2_DBG_INIT, "LPM disabled");
     }
 
-    BT_LDISC_DBG(V4L2_DBG_INIT, "LPM disabled");
-    return 0;
+    return ret;
 }
 
-void resetErrFlags(struct sh_proto_s *new_proto)
+/*******************************************************************************
+**
+** Function - reset_err_flags()
+**
+** Description - Reseting the error flag of a newly registered protocol driver
+**
+** Returns - void
+**
+*******************************************************************************/
+void reset_err_flags(struct component_interface *new_proto)
 {
-    struct hci_uart *hu;
-    hu_ref(&hu, 0);
+    struct hci_uart *hu = HU_REF;
 
-    // reset error flags as protocol driver has initiated registration
     switch(new_proto->type) {
-        case PROTO_SH_BT:
+        case COMPONENT_BT:
             hu->ldisc_bt_err = V4L2_ERR_FLAG_RESET;
-            BT_LDISC_DBG(V4L2_DBG_OPEN, "resetting bt_err");
+            BRCM_LDISC_DBG(V4L2_DBG_OPEN, "resetting bt_err");
             sysfs_notify(&hu->brcm_pdev->dev.kobj, NULL, "bt_err");
             break;
-        case PROTO_SH_FM:
+        case COMPONENT_FM:
             hu->ldisc_fm_err = V4L2_ERR_FLAG_RESET;
             sysfs_notify(&hu->brcm_pdev->dev.kobj, NULL, "fm_err");
-            BT_LDISC_DBG(V4L2_DBG_OPEN, "resetting fm_err");
+            BRCM_LDISC_DBG(V4L2_DBG_OPEN, "resetting fm_err");
             break;
         default:
-            BT_LDISC_ERR("Unknown proto id");
+            BRCM_LDISC_ERR("Unknown proto id");
+            break;
     }
 
 }
@@ -1136,33 +1344,29 @@ void resetErrFlags(struct sh_proto_s *new_proto)
 **
 ** Function - brcm_sh_ldisc_register()
 **
-** Description - Register protocol
-**              called from upper layer protocol stack drivers (BT or FM)
+** Description - Registering components;
+**              called from component stack drivers (BT or FM)
 **
 ** Returns - 0 if success; errno otherwise
 **
 *******************************************************************************/
-long brcm_sh_ldisc_register(struct sh_proto_s *new_proto)
+long brcm_sh_ldisc_register(struct component_interface *new_proto)
 {
     long err = 0;
-    unsigned long flags, diff;
-    struct hci_uart *hu;
+    unsigned long diff;
+    struct hci_uart *hu = HU_REF;
 
-    hu_ref(&hu, 0);
-    BT_LDISC_DBG(V4L2_DBG_OPEN, "%p",hu);
+    BRCM_LDISC_DBG(V4L2_DBG_OPEN, "%p",hu);
 
     if(new_proto->type != 0)
     {
-        BT_LDISC_DBG(V4L2_DBG_OPEN, "(%d) ", new_proto->type);
+        BRCM_LDISC_DBG(V4L2_DBG_OPEN, "(%d) ", new_proto->type);
     }
-    spin_lock_irqsave(&reg_lock, flags);
-    if (hu == NULL || /*hu->priv == NULL ||*/
-                new_proto == NULL || new_proto->recv == NULL)
+    if (hu == NULL || new_proto == NULL || new_proto->recv == NULL)
     {
-        spin_unlock_irqrestore(&reg_lock, flags);
         if (is_print_reg_error)
         {
-            BT_LDISC_DBG(V4L2_DBG_OPEN,"%d) ", new_proto->type);
+            BRCM_LDISC_DBG(V4L2_DBG_OPEN,"%d) ", new_proto->type);
             pr_err("hu/new_proto/recv or reg_complete_cb not ready");
             jiffi1 = jiffies;
             is_print_reg_error = 0;
@@ -1174,98 +1378,64 @@ long brcm_sh_ldisc_register(struct sh_proto_s *new_proto)
             if ( ((diff * HZ * 10) / HZ) >= 1000)
                 is_print_reg_error = 1;
         }
-        return -1;
+        return -EINVAL;
     }
 
     /* check if received proto is a valid proto */
-    if (new_proto->type < PROTO_SH_BT || new_proto->type >= PROTO_SH_MAX)
+    if (new_proto->type < COMPONENT_BT || new_proto->type >= COMPONENT_MAX)
     {
-        spin_unlock_irqrestore(&reg_lock, flags);
-        pr_err("protocol %d not supported", new_proto->type);
+        BRCM_LDISC_ERR("protocol %d not supported", new_proto->type);
         return -EPROTONOSUPPORT;
     }
 
-    if(new_proto->type == PROTO_SH_BT) {
-    	pr_err("enabling HCI Filter\n");
-    	hci_filter_enabled = true;
+    if (test_and_set_bit_lock(LDISC_SUB_PROTO_REG_UNREG_IN_PROGRESS, &hu->flags))
+        return -EBUSY;
+
+    if (test_bit(LDISC_OPENING, &hu->flags) || test_bit(LDISC_CLOSING, &hu->flags)) {
+        err = -EBUSY;
+        goto out;
     }
 
     /* check if protocol already registered */
-    if (hu->list[new_proto->type] != NULL)
-    {
-        spin_unlock_irqrestore(&reg_lock, flags);
-        BT_LDISC_DBG(V4L2_DBG_OPEN, "protocol %d already registered", new_proto->type);
-        return -EALREADY;
+    if (hu->components_registered & (1 << new_proto->type)) {
+        BRCM_LDISC_DBG(V4L2_DBG_OPEN, "protocol %d already registered", new_proto->type);
+        err = -EALREADY;
+        goto out;
     }
-    if (test_bit(LDISC_REG_IN_PROGRESS, &hu->sh_ldisc_state)) {
-        BT_LDISC_DBG(V4L2_DBG_OPEN, " LDISC_REG_IN_PROGRESS:%d ", new_proto->type);
-        /* fw download in progress */
 
-        add_channel_to_table(hu, new_proto);
-        hu->protos_registered++;
-        new_proto->write = brcm_sh_ldisc_write;
-
-        set_bit(LDISC_REG_PENDING, &hu->sh_ldisc_state);
-        spin_unlock_irqrestore(&reg_lock, flags);
-        return -EINPROGRESS;
-    } else if (hu->protos_registered == LDISC_EMPTY) {
-        BT_LDISC_DBG(V4L2_DBG_OPEN, " chnl_id list empty :%d ", new_proto->type);
-        set_bit(LDISC_REG_IN_PROGRESS, &hu->sh_ldisc_state);
-
-        /* release lock previously held - re-locked below */
-        spin_unlock_irqrestore(&reg_lock, flags);
+    if (!hu->components_registered) {
+        if ((err = reset_component_desc(hu, &init_interface))) {
+            BRCM_LDISC_ERR("Failed to set init_interface for initialisation");
+            goto out;
+        }
+        BRCM_LDISC_DBG(V4L2_DBG_OPEN, " chnl_id list empty :%d ", new_proto->type);
 
         err = brcm_sh_ldisc_start(hu);
-        BT_LDISC_DBG(V4L2_DBG_OPEN, "brcm_sh_ldisc_start response = %ld", err);
-        if (err != 0) {
-            clear_bit(LDISC_REG_IN_PROGRESS, &hu->sh_ldisc_state);
-            if ((hu->protos_registered != LDISC_EMPTY) &&
-                (test_bit(LDISC_REG_PENDING, &hu->sh_ldisc_state))) {
-                pr_err(" ldisc registration failed ");
-            }
-            return err == -EBUSY ? err : -EINVAL;
+        BRCM_LDISC_DBG(V4L2_DBG_OPEN, "brcm_sh_ldisc_start response = %ld", err);
+        if (err) {
+            put_component_desc(hu, init_interface.type);
+            err = (err == -EBUSY) ? err : -EINVAL;
+            goto out;
         }
-
-        BT_LDISC_DBG(V4L2_DBG_OPEN, "clearing flag LDISC_REG_IN_PROGRESS");
-        clear_bit(LDISC_REG_IN_PROGRESS, &hu->sh_ldisc_state);
-
-        BT_LDISC_DBG(V4L2_DBG_OPEN,"clearing flag LDISC_REG_PENDING");
-        clear_bit(LDISC_REG_PENDING, &hu->sh_ldisc_state);
-
-        /* check for already registered once more, since the above check is old */
-        BT_LDISC_DBG(V4L2_DBG_OPEN, "checking already registerd proto");
-        if (hu->is_registered[new_proto->type] == true) {
-            pr_err(" proto %d already registered ",
-                   new_proto->type);
-            return -EALREADY;
-        }
-
-        spin_lock_irqsave(&reg_lock, flags);
-
-        add_channel_to_table(hu, new_proto);
-        hu->protos_registered++;
-        BT_LDISC_DBG(V4L2_DBG_OPEN, "Changed hu->protos_registered = %d",
-                                                      hu->protos_registered);
-        new_proto->write = brcm_sh_ldisc_write;
-        spin_unlock_irqrestore(&reg_lock, flags);
-        resetErrFlags(new_proto);
-
-        BT_LDISC_DBG(V4L2_DBG_OPEN, "exiting %s with err = %ld", __func__, err);
-        return err;
-    }
-    /* if firmware patchram is already downloaded & new protocol driver registers */
-    else {
-        add_channel_to_table(hu, new_proto);
-        hu->protos_registered++;
-        BT_LDISC_DBG(V4L2_DBG_OPEN, "Changed hu->protos_registered = %d",
-                                                      hu->protos_registered);
-        new_proto->write = brcm_sh_ldisc_write;
-        spin_unlock_irqrestore(&reg_lock, flags);
-        resetErrFlags(new_proto);
-        return err;
     }
 
-    BT_LDISC_DBG(V4L2_DBG_OPEN, "done (%d) ", new_proto->type);
+    new_proto->write = brcm_sh_ldisc_write;
+    reset_err_flags(new_proto);
+    err = reset_component_desc(hu, new_proto);
+    if (err) {
+        brcm_sh_ldisc_stop(hu, 1);
+        goto out;
+    }
+
+    hu->components_registered |= (1 << new_proto->type);
+    BRCM_LDISC_DBG(V4L2_DBG_OPEN, "Changed hu->components_registered = 0x%X",
+            hu->components_registered);
+
+
+    BRCM_LDISC_DBG(V4L2_DBG_OPEN, "done (%d) ", new_proto->type);
+
+out:
+    clear_bit_unlock(LDISC_SUB_PROTO_REG_UNREG_IN_PROGRESS, &hu->flags);
     return err;
 }
 EXPORT_SYMBOL(brcm_sh_ldisc_register);
@@ -1275,68 +1445,141 @@ EXPORT_SYMBOL(brcm_sh_ldisc_register);
 **
 ** Function - brcm_sh_ldisc_unregister()
 **
-** Description - UnRegister protocol
-**              called from upper layer protocol stack drivers (BT or FM)
+** Description - Unregister components;
+**              called from component stack drivers (BT or FM)
 **
 ** Returns - 0 if success; errno otherwise
 **
 *******************************************************************************/
-long brcm_sh_ldisc_unregister(enum proto_type type, bool btsleep_open)
+long brcm_sh_ldisc_unregister(enum component_type type, bool btsleep_open)
 {
-    long err = 0;
     unsigned long flags;
-    struct hci_uart *hu;
+    struct hci_uart *hu = HU_REF;
+	int components_registered = 0, err = 0;
 
-    BT_LDISC_DBG(V4L2_DBG_CLOSE,"%d ", type);
 
-    if (type < PROTO_SH_BT || type >= PROTO_SH_MAX)
+    BRCM_LDISC_DBG(V4L2_DBG_CLOSE,"%d ", type);
+
+    if (type < COMPONENT_BT || type >= COMPONENT_MAX)
     {
-        pr_err(" protocol %d not supported", type);
+        BRCM_LDISC_ERR(" protocol %d not supported", type);
         return -EPROTONOSUPPORT;
     }
 
-    spin_lock_irqsave(&reg_lock, flags);
-    hu_ref(&hu, 0);
-    BT_LDISC_DBG(V4L2_DBG_CLOSE, "%p ", hu);
+    BRCM_LDISC_DBG(V4L2_DBG_CLOSE, "%p ", hu);
 
-     if (hu == NULL)
+    if (hu == NULL)
     {
-        spin_unlock_irqrestore(&reg_lock, flags);
-        pr_err(" protocol %d not registered", type);
-        return -EPROTONOSUPPORT;
+        BRCM_LDISC_ERR("hu is NULL");
+        return -EINVAL;
     }
 
-    if(hu->protos_registered > 0)
-        hu->protos_registered--;
-    BT_LDISC_DBG(V4L2_DBG_CLOSE, "Changed hu->protos_registered = %d",hu->protos_registered);
-    remove_channel_from_table(hu,type);
-    spin_unlock_irqrestore(&reg_lock, flags);
+    if (test_and_set_bit_lock(LDISC_SUB_PROTO_REG_UNREG_IN_PROGRESS, &hu->flags))
+        return -EBUSY;
 
-    /* Power OFF chip only if no protos are registered.
+    if (test_bit(LDISC_OPENING, &hu->flags) || test_bit(LDISC_CLOSING, &hu->flags)) {
+        err = -EBUSY;
+        goto out;
+    }
+
+    if (!put_component_desc(hu, type)) {
+        BRCM_LDISC_ERR("protocol %d is already unregistered", type);
+        err = -EALREADY;
+        goto out;
+    }
+
+    hu->components_registered &= ~(1 << type);
+
+    BRCM_LDISC_DBG(V4L2_DBG_CLOSE, "Changed hu->components_registered = 0x%X", hu->components_registered);
+
+    /* Power OFF chip only if no components are registered.
        Send notification to UIM to power OFF chip */
-    if ((hu->protos_registered == 0) &&
-        (!test_bit(LDISC_REG_PENDING, &hu->sh_ldisc_state)) &&
-        (!test_bit(LDISC_REG_IN_PROGRESS, &hu->sh_ldisc_state))) {
+    if (!hu->components_registered) {
 
-        BT_LDISC_DBG(V4L2_DBG_CLOSE," all chnl_ids unregistered ");
+        BRCM_LDISC_DBG(V4L2_DBG_CLOSE," all chnl_ids unregistered ");
 
         /* stop traffic on tty */
         if (hu->tty){
-            BT_LDISC_DBG(V4L2_DBG_CLOSE," calling tty_ldisc_flush ");
+            BRCM_LDISC_DBG(V4L2_DBG_CLOSE," calling tty_ldisc_flush ");
             tty_ldisc_flush(hu->tty);
-            BT_LDISC_DBG(V4L2_DBG_CLOSE," calling stop_tty ");
+            BRCM_LDISC_DBG(V4L2_DBG_CLOSE," calling stop_tty ");
             stop_tty(hu->tty);
         }
 
-        /* all chnl_ids now unregistered */
         brcm_sh_ldisc_stop(hu, btsleep_open);
     }
+
+out:
+    clear_bit_unlock(LDISC_SUB_PROTO_REG_UNREG_IN_PROGRESS, &hu->flags);
 
     return err;
 }
 EXPORT_SYMBOL(brcm_sh_ldisc_unregister);
 
 
+/*******************************************************************************
+**
+** Function - brcm_sh_ldisc_extract_hcicmd_sync_id()
+**
+** Description - The sync-id extracting function from hcicmd packets sent
+**             internally in the blocking mode;
+**
+** Returns - an id > 0 if success; 0 otherwise
+**
+*******************************************************************************/
+static __u32 brcm_sh_ldisc_extract_hcicmd_sync_id(struct sk_buff *skb)
+{
+    __u32 sync_id = 0, len_expected = 1;
+    if (skb->len < len_expected)
+        return sync_id;
+
+    switch (skb->data[0]) {
+        case HCI_COMMAND_PKT: {
+            len_expected += sizeof(struct hci_command_hdr);
+            if (skb->len < len_expected)
+                break;
+
+            sync_id = __le16_to_cpu(((struct hci_command_hdr *)(skb->data+1))->opcode);
+
+            break;
+        }
+        case HCI_EVENT_PKT: {
+            len_expected += sizeof(struct hci_event_hdr);
+            if (skb->len < len_expected)
+                break;
+
+            struct hci_event_hdr *ev_hdr = (struct hci_event_hdr *)(skb->data+1);
+
+            switch (ev_hdr->evt) {
+                case HCI_EV_CMD_COMPLETE: {
+                    len_expected += sizeof(struct hci_ev_cmd_complete);
+                    if (skb->len < len_expected)
+                        break;
+
+                    sync_id = __le16_to_cpu(((struct hci_ev_cmd_complete *)(ev_hdr+1))->opcode);
+                    break;
+                }
+#if 0
+                case HCI_EV_CMD_STATUS: {
+                    len_expected += sizeof(struct hci_ev_cmd_status);
+                    if (skb->len < len_expected)
+                        break;
+
+                    sync_id = __le16_to_cpu(((struct hci_ev_cmd_status *)(ev_hdr+1))->opcode);
+                    break;
+                }
+#endif
+                default:
+                    break;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
+    return sync_id;
+}
 
 /*****************************************************************************
 * Function to encode baudrate from int to char sequence
@@ -1414,31 +1657,34 @@ BRCM_encode_bd_address( unsigned char  *bd_addrr)
 
 /*****************************************************************************
 * Function to read BD ADDR from bluetooth chip.
+* Note that the resp_buffer will only get updated when LDISC_EMPTY, and therefore this call can only be invoked during setup
+* (e.g. triggered by brcm_sh_ldisc_start())
+*
 *****************************************************************************/
 static long read_bd_addr(struct hci_uart *hu)
 {
     long err = 0;
-    long len =0;
-    int i = 0;
 
-    struct tty_struct *tty;
     const char hci_read_bdaddr[] = { 0x01, 0x09, 0x10, 0x00 };
-    tty = hu->tty;
 
-    init_completion(&hu->cmd_rcvd);
+    struct sk_buff *resp = send_hci_pkt_internal(hu, hci_read_bdaddr, sizeof(hci_read_bdaddr), false);
 
-    len = brcm_hci_write(hu, hci_read_bdaddr, 4);
+    if (IS_ERR_OR_NULL(resp)) {
+        err = PTR_ERR(resp);
+        if (!resp)
+            err = -EFAULT;
 
-    if(!wait_for_completion_timeout
-            (&hu->cmd_rcvd, msecs_to_jiffies(CMD_RESP_TIME))) {
-            pr_err(" waiting for READ_BD_ADDR command response - timed out ");
-            return -ETIMEDOUT;
-        }
+        BRCM_LDISC_ERR("An error (%d) while reading bdaddr", err);
+    } else {
+        int i = 0;
 
-    BT_LDISC_DBG(V4L2_DBG_INIT, "read_bd_addr, received wait_completion");
-    for (i=0;i<=5;i++){
-        bd_addr_array[i] = (unsigned char)hu->priv->resp_buffer[7+i];
+        BRCM_LDISC_DBG(V4L2_DBG_INIT, "read_bd_addr, response received");
+        for (i=0;i<=5;i++)
+            bd_addr_array[i] = (unsigned char)resp->data[7+i];
+
+        kfree_skb(resp);
     }
+
     return err;
 }
 
@@ -1473,7 +1719,7 @@ static long download_patchram(struct hci_uart *hu)
     long err = 0;
     long len =0;
     struct tty_struct *tty = hu->tty;
-    uint8_t hci_writesleepmode_cmd[35] = {0};
+    uint8_t hci_writesleepmode_cmd[16] = {0};
     unsigned char *ptr;
 
     const unsigned char hci_download_minidriver[] = { 0x01, 0x2e, 0xfc, 0x00 };
@@ -1486,8 +1732,9 @@ static long download_patchram(struct hci_uart *hu)
 
     unsigned char *buf = NULL;
     struct ktermios ktermios;
-	if (!(buf = kmalloc(RESP_BUFF_SIZE, GFP_KERNEL))) {
-        BT_LDISC_ERR("Unable to allocate memory for buf");
+
+	if (!(buf = kmalloc(HCI_MAX_FRAME_SIZE, GFP_KERNEL))) {
+        BRCM_LDISC_ERR("Unable to allocate memory for buf");
         err = -ENOMEM;
         goto error_state;
     }
@@ -1503,61 +1750,60 @@ static long download_patchram(struct hci_uart *hu)
 #endif
     ptr = NULL;
 
-    BT_LDISC_DBG(V4L2_DBG_INIT, "tty = %p hu = %p", tty,hu);
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "tty = %p hu = %p", tty,hu);
 
     /* request_firmware searches for patchram file. only in /vendor/firmware OR /etc/firmware */
-    BT_LDISC_DBG(V4L2_DBG_INIT, "firmware patchram file: %s", fw_name);
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "firmware patchram file: %s", fw_name);
     err = request_firmware(&hu->fw_entry, fw_name,
                  &hu->brcm_pdev->dev);
 
     /* patchram download failure */
     if ((unlikely((err != 0) || (hu->fw_entry->data == NULL) ||
          (hu->fw_entry->size == 0)))) {
-         BT_LDISC_ERR("************* ERROR !!! Unable to download patchram \
+         BRCM_LDISC_ERR("************* ERROR !!! Unable to download patchram \
             OR file %s not found **************", fw_name);
     }
     else {
         ptr = (void *)hu->fw_entry->data;
         len = hu->fw_entry->size;
 
-        BT_LDISC_DBG(V4L2_DBG_INIT, " with header patchram data ptr %p, \
+        BRCM_LDISC_DBG(V4L2_DBG_INIT, " with header patchram data ptr %p, \
             len %ld ",ptr,len);
 
         /* write command for hci_download_minidriver. Perform this before patchram download */
-        BT_LDISC_DBG(V4L2_DBG_INIT, "writing hci_download_minidriver");
-        init_completion(&hu->cmd_rcvd);
+        BRCM_LDISC_DBG(V4L2_DBG_INIT, "writing hci_download_minidriver");
 
-        brcm_hci_write(hu, hci_download_minidriver, 4);
+        err = PTR_ERR(send_hci_pkt_internal(hu, hci_download_minidriver, sizeof(hci_download_minidriver), true));
 
-        /* delay before patchram download */
-        msleep(50);
+        if (!err) {
+            /* delay before patchram download */
+            msleep(50);
+            /* start downloading firmware */
+            while(len>0 && !err) {
+                buf[0] = 0x01;
+                memcpy(buf+1, ptr, 3);
+                ptr += 3;
+                /* buf[3] holds the len of data to send */
+                memcpy(buf+4, ptr, buf[3]);
+                len -= buf[3] + 3;
 
-        /* start downloading firmware */
-        do {
-            buf[0] = 0x01;
-            memcpy(buf+1, ptr, 3);
-            ptr += 3;
-            /* buf[3] holds the len of data to send */
-            memcpy(buf+4, ptr, buf[3]);
-            len -= buf[3] + 3;
+                err = PTR_ERR(send_hci_pkt_internal(hu, buf, buf[3] + 4, true));
+                ptr += buf[3];
 
-            init_completion(&hu->cmd_rcvd);
-            brcm_hci_write(hu, buf, buf[3] + 4);
-
-            ptr += buf[3];
-
-            if (!wait_for_completion_timeout
-              (&hu->cmd_rcvd, msecs_to_jiffies(CMD_RESP_TIME))) {
-                BT_LDISC_ERR(" waiting for download patchram command response \
-                    - timed out ");
-                return -ETIMEDOUT;
             }
-        } while(len>0);
 
-        BT_LDISC_DBG(V4L2_DBG_INIT, "fw patchram download complete");
+        }
+
+        if (err == -ETIMEDOUT) {
+            BRCM_LDISC_ERR(" waiting for download patchram command response - timed out ");
+        }
+        if (err)
+            goto error_state;
+
+        BRCM_LDISC_DBG(V4L2_DBG_INIT, "fw patchram download complete");
 
         /* settlement delay */
-        BT_LDISC_DBG(V4L2_DBG_INIT, "patchram_settlement_delay = %d", \
+        BRCM_LDISC_DBG(V4L2_DBG_INIT, "patchram_settlement_delay = %d", \
             patchram_settlement_delay);
         msleep(patchram_settlement_delay);
 
@@ -1570,66 +1816,59 @@ static long download_patchram(struct hci_uart *hu)
 #else
         memcpy(&ktermios, &(tty->termios), sizeof(ktermios));
 #endif
-        BT_LDISC_DBG(V4L2_DBG_INIT, "before setting baudrate = %d\n",
+        BRCM_LDISC_DBG(V4L2_DBG_INIT, "before setting baudrate = %d\n",
                                      (speed_t)(ktermios.c_cflag & CBAUD));
         ktermios.c_cflag = (ktermios.c_cflag & ~CBAUD) | (B115200 & CBAUD);
         tty_set_termios(tty, &ktermios);
 
         msleep(20);
 
-        BT_LDISC_DBG(V4L2_DBG_INIT, "after setting baudrate = %d\n",
+        BRCM_LDISC_DBG(V4L2_DBG_INIT, "after setting baudrate = %d\n",
                                            (speed_t)(ktermios.c_cflag & CBAUD));
     }
 
     /* Perform HCI Reset */
-    init_completion(&hu->cmd_rcvd);
-    BT_LDISC_DBG(V4L2_DBG_INIT, "Performing HCI Reset");
-    brcm_hci_write(hu, hci_reset_cmd, 4);
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "Performing HCI Reset");
 
-    if (!wait_for_completion_timeout
-          (&hu->cmd_rcvd, msecs_to_jiffies(CMD_RESP_TIME))) {
-            pr_err(" waiting for HCI Reset command response - timed out ");
-            err = -ETIMEDOUT;
-            goto error_state;
+    err = PTR_ERR(send_hci_pkt_internal(hu, hci_reset_cmd, sizeof(hci_reset_cmd), true));
+    if (err == -ETIMEDOUT) {
+        BRCM_LDISC_ERR(" waiting for HCI Reset command response - timed out ");
     }
-    BT_LDISC_DBG(V4L2_DBG_INIT, "%s HCI Reset complete", __func__);
+    if (err)
+        goto error_state;
+
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "%s HCI Reset complete", __func__);
 
     /* set UART clock rate to 48 MHz */
-    if( custom_baudrate > CLOCK_SET_BAUDRATE){
-        init_completion(&hu->cmd_rcvd);
-        BT_LDISC_DBG(V4L2_DBG_INIT, "Baudrate > %ld UART clock set to 48 MHz",
-                                                  (unsigned long)CLOCK_SET_BAUDRATE);
-        brcm_hci_write(hu, hci_uartclockset_cmd, 5);
+    if( custom_baudrate > CLOCK_SET_BAUDRATE) {
+        BRCM_LDISC_DBG(V4L2_DBG_INIT, "Baudrate > %ld UART clock set to 48 MHz",
+                (unsigned long)CLOCK_SET_BAUDRATE);
 
-        if (!wait_for_completion_timeout
-               (&hu->cmd_rcvd, msecs_to_jiffies(CMD_RESP_TIME))) {
-            BT_LDISC_ERR(" waiting for UART clock set command response \
-                - timed out");
-            err = -ETIMEDOUT;
-            goto error_state;
+        err = PTR_ERR(send_hci_pkt_internal(hu, hci_uartclockset_cmd, sizeof(hci_uartclockset_cmd), true));
+        if (err == -ETIMEDOUT) {
+            BRCM_LDISC_ERR(" waiting for UART clock set command response - timed out");
         }
+        if (err)
+            goto error_state;
     }
 
     /* set baud rate back to custom baudrate */
-    init_completion(&hu->cmd_rcvd);
-    BT_LDISC_DBG(V4L2_DBG_INIT,"set baud rate back to %ld", custom_baudrate);
+    BRCM_LDISC_DBG(V4L2_DBG_INIT,"set baud rate back to %ld", custom_baudrate);
 
     BRCM_encode_baud_rate(custom_baudrate, &hci_update_baud_rate[6]);
 
-    brcm_hci_write(hu, hci_update_baud_rate, 10);
+    err = PTR_ERR(send_hci_pkt_internal(hu, hci_update_baud_rate, sizeof(hci_update_baud_rate), true));
 
-    if (!wait_for_completion_timeout
-          (&hu->cmd_rcvd, msecs_to_jiffies(CMD_RESP_TIME))) {
-            pr_err(" waiting for set baud rate back to %ld command response \
-                - timed out", custom_baudrate);
-            err = -ETIMEDOUT;
-            goto error_state;
+    if (err == -ETIMEDOUT) {
+        BRCM_LDISC_ERR(" waiting for set baud rate back to %ld command response - timed out", custom_baudrate);
     }
+    if (err)
+        goto error_state;
 
     ktermios.c_cflag = (ktermios.c_cflag & ~CBAUD) |
         (baud_rates[lookup_baudrate(custom_baudrate)].termios_value & CBAUD);
     tty_set_termios(tty, &ktermios);
-    BT_LDISC_DBG(V4L2_DBG_INIT, "after setting baudrate = %d\n",
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "after setting baudrate = %d\n",
                                           (speed_t)(ktermios.c_cflag & CBAUD));
 
     if(ControllerAddrRead){
@@ -1643,50 +1882,48 @@ static long download_patchram(struct hci_uart *hu)
     }
     else
         str2bd(bd_addr,(bt_bdaddr_t*)bd_addr_array);
-    BT_LDISC_DBG(V4L2_DBG_INIT, "BD ADDRESS going to  set is "\
+
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "BD ADDRESS going to  set is "\
         "%02X:%02X:%02X:%02X:%02X:%02X",
          bd_addr_array[0], bd_addr_array[1], bd_addr_array[2],
          bd_addr_array[3], bd_addr_array[4], bd_addr_array[5]);
 
     /* set BD address */
-    init_completion(&hu->cmd_rcvd);
     BRCM_encode_bd_address(&hci_update_bd_addr[4]);
 
-    brcm_hci_write(hu, hci_update_bd_addr, 10);
-    if (!wait_for_completion_timeout
-          (&hu->cmd_rcvd, msecs_to_jiffies(CMD_RESP_TIME))) {
-            pr_err(" waiting for set bd addr command response \
+    err = PTR_ERR(send_hci_pkt_internal(hu, hci_update_bd_addr, sizeof(hci_update_bd_addr), true));
+    if (err == -ETIMEDOUT) {
+        BRCM_LDISC_ERR(" waiting for set bd addr command response \
                 - timed out");
-            err = -ETIMEDOUT;
-            goto error_state;
     }
-   BT_LDISC_DBG(V4L2_DBG_INIT, "BD ADDRESS set to "\
-        "%02X:%02X:%02X:%02X:%02X:%02X",
-        bd_addr_array[0], bd_addr_array[1], bd_addr_array[2],
-        bd_addr_array[3], bd_addr_array[4], bd_addr_array[5]);
+    if (err)
+        goto error_state;
+
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "BD ADDRESS set to "\
+            "%02X:%02X:%02X:%02X:%02X:%02X",
+            bd_addr_array[0], bd_addr_array[1], bd_addr_array[2],
+            bd_addr_array[3], bd_addr_array[4], bd_addr_array[5]);
 
     /* Enable/Disable LPM should be configurable based on the module param */
-    init_completion(&hu->cmd_rcvd);
-    BT_LDISC_DBG(V4L2_DBG_INIT, "lpm param %s", lpm_param);
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "lpm param %s", lpm_param);
     str2arr(lpm_param, (uint8_t*) hci_writesleepmode_cmd, 16);
 
-     BT_LDISC_DBG(V4L2_DBG_INIT,"LPM PARAM set to "\
-        "%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X:"\
-        "%02X:%02X:%02X:%02X:%02X:%02X:%02X",
-     hci_writesleepmode_cmd[0], hci_writesleepmode_cmd[1], hci_writesleepmode_cmd[2],
-     hci_writesleepmode_cmd[3],hci_writesleepmode_cmd[4], hci_writesleepmode_cmd[5],
-     hci_writesleepmode_cmd[6],hci_writesleepmode_cmd[7], hci_writesleepmode_cmd[8],
-     hci_writesleepmode_cmd[9],hci_writesleepmode_cmd[10], hci_writesleepmode_cmd[11],
-     hci_writesleepmode_cmd[12],hci_writesleepmode_cmd[13],hci_writesleepmode_cmd[14],
-     hci_writesleepmode_cmd[15]);
+    BRCM_LDISC_DBG(V4L2_DBG_INIT,"LPM PARAM set to "\
+            "%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X:"\
+            "%02X:%02X:%02X:%02X:%02X:%02X:%02X",
+            hci_writesleepmode_cmd[0], hci_writesleepmode_cmd[1], hci_writesleepmode_cmd[2],
+            hci_writesleepmode_cmd[3],hci_writesleepmode_cmd[4], hci_writesleepmode_cmd[5],
+            hci_writesleepmode_cmd[6],hci_writesleepmode_cmd[7], hci_writesleepmode_cmd[8],
+            hci_writesleepmode_cmd[9],hci_writesleepmode_cmd[10], hci_writesleepmode_cmd[11],
+            hci_writesleepmode_cmd[12],hci_writesleepmode_cmd[13],hci_writesleepmode_cmd[14],
+            hci_writesleepmode_cmd[15]);
 
-    brcm_hci_write(hu, hci_writesleepmode_cmd, 16);
-    if (!wait_for_completion_timeout
-          (&hu->cmd_rcvd, msecs_to_jiffies(CMD_RESP_TIME))) {
-            pr_err(" waiting for set LPM command response timed out");
-            err = -ETIMEDOUT;
-            goto error_state;
+    err = PTR_ERR(send_hci_pkt_internal(hu, hci_writesleepmode_cmd, sizeof(hci_writesleepmode_cmd), true));
+    if (err == -ETIMEDOUT) {
+        BRCM_LDISC_ERR(" waiting for set LPM command response timed out");
     }
+    if (err)
+        goto error_state;
 
     err = 0;
 
@@ -1696,14 +1933,33 @@ error_state:
 }
 
 
-/**
- * brcm_sh_ldisc_stop - called  on the last un-registration */
 
-long brcm_sh_ldisc_stop(struct hci_uart *hu, bool btsleep_open)
+/*******************************************************************************
+**
+** Function - brcm_sh_ldisc_stop()
+**
+** Description - Initiating the stop process, which involves
+**             collaboration with UIM closing the ldisc device
+**
+** Returns - 0 if successful; an negative errno otherwise
+**
+*******************************************************************************/
+static long brcm_sh_ldisc_stop(struct hci_uart *hu, bool btsleep_open)
 {
     long err = 0;
 
+    if (test_and_set_bit_lock(LDISC_STOPPING, &hu->flags))
+        return -EBUSY;
+
+    if (!test_bit(LDISC_STARTING, &hu->flags) && !test_bit(LDISC_OPENED, &hu->flags)) {
+
+        BRCM_LDISC_ERR("brcm_sh_ldisc_stop should only be called while the device is starting or has been opened");
+        err = -EINVAL;
+        goto out;
+    }
+
     reinit_completion(&hu->ldisc_installed);
+    reinit_completion(&hu->tty_close_complete);
 
     if(btsleep_open)
         brcm_btsleep_stop(sleep);
@@ -1713,23 +1969,36 @@ long brcm_sh_ldisc_stop(struct hci_uart *hu, bool btsleep_open)
     sysfs_notify(&hu->brcm_pdev->dev.kobj, NULL, "install");
 
     /* wait for ldisc to be un-installed */
-    err = wait_for_completion_timeout(&hu->ldisc_installed,
-            msecs_to_jiffies(LDISC_TIME));
-    if (!err) {     /* timeout */
-        BT_LDISC_ERR(" timed out waiting for ldisc to be un-installed");
-        return -ETIMEDOUT;
+    if (!wait_for_completion_timeout(&hu->ldisc_installed, msecs_to_jiffies(LDISC_TIME))) {
+        /* timeout */
+        BRCM_LDISC_ERR(" timed out waiting for ldisc to be un-installed");
+        err = -ETIMEDOUT;
+        goto out;
     }
 
+    if (!wait_for_completion_timeout(&hu->tty_close_complete, msecs_to_jiffies(TTY_CLOSE_TIME))) {
+        BRCM_LDISC_ERR("tty close timed out");
+        err = -ETIMEDOUT;
+        goto out;
+    }
+
+out:
+    clear_bit_unlock(LDISC_STOPPING, &hu->flags);
     return err;
 }
 
-/**
- *  This involves  reading the firmware version from chip,
- *    forming the fw file name
- *  based on the chip version, requesting the fw, parsing it
- *  and perform download(send/recv).
- */
-long brcm_sh_ldisc_start(struct hci_uart *hu)
+/*******************************************************************************
+**
+** Function - brcm_sh_ldisc_start()
+**
+** Description - Initiating the start process, which involves
+**             collaboration with UIM and invokes download_patchram()
+**             to reset the device with a proper firmware
+**
+** Returns - 0 if successful; an negative errno otherwise
+**
+*******************************************************************************/
+static long brcm_sh_ldisc_start(struct hci_uart *hu)
 {
     long err = 0;
     long retry = POR_RETRY_COUNT;
@@ -1737,81 +2006,57 @@ long brcm_sh_ldisc_start(struct hci_uart *hu)
 
     struct tty_struct *tty = hu->tty;
 
-    BT_LDISC_DBG(V4L2_DBG_INIT, " %p",tty);
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, " %p",tty);
+
+    if (test_and_set_bit_lock(LDISC_STARTING, &hu->flags))
+        return -EBUSY;
+
 
     do {
-        if(brcm_btsleep_start(sleep) == -EBUSY)
-            return -EBUSY;
+        if (brcm_btsleep_start(sleep) == -EBUSY) {
+            err = -EBUSY;
+            break;
+        }
 
         reinit_completion(&hu->ldisc_installed);
         /* send notification to UIM */
         hu->ldisc_install = V4L2_STATUS_ON;
-        BT_LDISC_DBG(V4L2_DBG_INIT, "ldisc_install = %c",\
-            hu->ldisc_install);
+        BRCM_LDISC_DBG(V4L2_DBG_INIT, "ldisc_install = %c",\
+                hu->ldisc_install);
         sysfs_notify(&hu->brcm_pdev->dev.kobj,
-            NULL, "install");
+                NULL, "install");
 
         /* wait for ldisc to be installed */
         err = wait_for_completion_timeout(&hu->ldisc_installed,
                 msecs_to_jiffies(LDISC_TIME));
         if (!err) { /* timeout */
             pr_err("line disc installation timed out ");
-            reinit_completion(&hu->tty_close_complete);
-            err = brcm_sh_ldisc_stop(hu, 1);
-            cl_err = wait_for_completion_timeout(&hu->tty_close_complete,
-                    msecs_to_jiffies(TTY_CLOSE_TIME));
-            if (!cl_err) { /* timeout */
-                pr_err("tty close timed out");
+            cl_err = brcm_sh_ldisc_stop(hu, 1);
+            if (cl_err)
                 break;
-            }
             continue;
         } else {
             /* ldisc installed now */
-            BT_LDISC_DBG(V4L2_DBG_INIT, " line discipline installed ");
+            BRCM_LDISC_DBG(V4L2_DBG_INIT, " line discipline installed ");
             err = download_patchram(hu);
             if (err != 0) {
                 pr_err("patchram download failed");
-                reinit_completion(&hu->tty_close_complete);
-                brcm_sh_ldisc_stop(hu, 1);
-                cl_err = wait_for_completion_timeout(&hu->tty_close_complete,
-                        msecs_to_jiffies(TTY_CLOSE_TIME));
-                if (!cl_err) { /* timeout */
-                    pr_err("tty close timed out");
+                cl_err = brcm_sh_ldisc_stop(hu, 1);
+                if (cl_err)
                     break;
-                }
                 continue;
             } else {/* on success don't retry */
-                BT_LDISC_DBG(V4L2_DBG_INIT, "patchram downloaded successfully");
+                BRCM_LDISC_DBG(V4L2_DBG_INIT, "patchram downloaded successfully");
                 // initialize lock for err flags
                 spin_lock_init(&hu->err_lock);
+
                 break;
             }
         }
     } while (retry--);
 
+    clear_bit_unlock(LDISC_STARTING, &hu->flags);
     return err;
-}
-
-
-/*******************************************************************************
-**
-** Function - equals_hci_ev()
-**
-** Description - Checks if the received packet equals the given HCI command.
-**
-** Returns - true if the packet is the HCI cmd; false otherwise
-**
-*******************************************************************************/
-static bool pkt_equals_hci_ev(struct sk_buff *skb, uint16_t hci_event)
-{
-    unsigned char first_byte = (unsigned char)((hci_event >> 8) & 0xFF);
-    unsigned char second_byte = (unsigned char)(hci_event & 0xFF);
-
-    if(skb->len > 2 && (skb->data)[1] == second_byte && (skb->data)[2] == first_byte) {
-        return true;
-    }
-
-    return false;
 }
 
 
@@ -1831,197 +2076,57 @@ static bool ignore_hci_cmd(struct sk_buff *skb)
     if(skb->len < 3 || (skb->len > 0 && (skb->data)[0] != 0x01)) {
         return false;
     }
+    else {
+        int cmd_cnt = 0;
+        struct hci_command_hdr *hdr = (struct hci_command_hdr *)(skb->data+1);
+        __u16 opcode = __le16_to_cpu(hdr->opcode);
 
-    static bool reset_received, is_bt_init, is_bt_init_end;
-    int cmd_cnt = 0;
-    unsigned char first_byte, second_byte;
-
-    for( ; cmd_cnt < IGNORE_CMD_SIZE; cmd_cnt++) {
-        if(pkt_equals_hci_ev(skb, IGNORE_CMDS[cmd_cnt])) {
-            return true;
+        for( ; cmd_cnt < IGNORE_CMD_SIZE; cmd_cnt++) {
+            if(opcode == IGNORE_CMDS[cmd_cnt]) {
+                return true;
+            }
         }
     }
 
     return false;
 }
-
-/*******************************************************************************
-**
-** Function - hci_cfg_sequence_end()
-**
-** Description - Checks if the received packet is a HCI command that is the final
-**               command emmitted by libbt to configure the BT/FM chip. Internally,
-**               the HCI commands belonging to the config end sequence modify the
-**               state such that "true" is only returned for the matching
-**               sequence.
-**
-** Returns - true if the packet is HCI cmd of the configuration end sequence.
-**
-*******************************************************************************/
-static bool hci_cfg_sequence_end(struct sk_buff *skb) {
-    static u8 end_cmd_cnt = 0;
-
-    if(end_cmd_cnt == 0 && pkt_equals_hci_ev(skb, 0xfc01)) {
-        end_cmd_cnt++;
-        return false;
-    } else if (end_cmd_cnt == 1 && pkt_equals_hci_ev(skb, 0x0c03)) {
-        end_cmd_cnt++;
-        return false;
-    }  else if (end_cmd_cnt == 2 && pkt_equals_hci_ev(skb, 0x0c33)) {
-        end_cmd_cnt++;
-        return true;
-    }
-
-    end_cmd_cnt = 0;
-    return false;
-}
-
 
 /*******************************************************************************
 **
 ** Function - brcm_sh_ldisc_write()
 **
-** Description - Function to write to the shared line discipline driver
-**              called from upper layer protocol stack drivers (BT or FM)
-**              via the write function pointer
+** Description - Writing a sk_buff packet to the shared line discipline driver;
+**              called from component stack drivers (BT or FM)
+**              via a function pointer to it in a process context (kernel thread).
+**
+**              Note that only when input skbs are processed successfully,
+**              will their ownership be transfered; therefore,
+**              callers are still responsible for packets' lifespan if errors occur
 **
 ** Returns - 0 if success; errno otherwise
 **
 *******************************************************************************/
-long brcm_sh_ldisc_write(struct sk_buff *skb)
+static struct sk_buff *brcm_sh_ldisc_write(struct sk_buff *skb, bool never_blocking)
 {
-    enum proto_type protoid = PROTO_SH_MAX;
-    long len;
-    struct brcm_struct *brcm;
-    char ptr[MAX_HCI_EVENT_LEN + 2] = {0};
-    int hci_response_data_len = 4;
-    int hci_response_len = hci_response_data_len + 2; // (+ add. header bytes)
+    struct hci_uart *hu = HU_REF;
 
-    struct hci_uart *hu;
-    hu_ref(&hu,0);
-
-    brcm = hu->priv;
-
-
-    BT_LDISC_DBG(V4L2_DBG_TX, "%p",hu);
+    BRCM_LDISC_DBG(V4L2_DBG_TX, "%p",hu);
 
     if (unlikely(skb == NULL))
     {
-        pr_err("data unavailable to perform write");
-        return -1;
+        BRCM_LDISC_ERR("data unavailable to perform write");
+        return -EFAULT;
     }
 
     if (unlikely(hu == NULL || hu->tty == NULL))
     {
-        pr_err("tty unavailable to perform write");
-        return -1;
+        BRCM_LDISC_ERR("tty unavailable to perform write");
+        return -EFAULT;
     }
 
-    switch (sh_ldisc_cb(skb)->pkt_type)
-    {
-        case HCI_COMMAND_PKT:
-        case HCI_ACLDATA_PKT:
-        case HCI_SCODATA_PKT:
-            protoid = PROTO_SH_BT;
-            break;
-#ifdef V4L2_ANT
-       case ANT_PKT:
-            protoid = PROTO_SH_ANT;
-            break;
-#endif
-        case FM_CH8_PKT:
-            protoid = PROTO_SH_FM;
-            break;
-    }
-
-    if (unlikely(hu->list[protoid] == NULL))
-    {
-        pr_err(" protocol %d not registered, and writing? ",
-                            protoid);
-        return -1;
-    }
-
-    len = skb->len;
-
-    /* HCI reset commands & those used during libbt init will be answered
-     * by fake responses (not needed), such that no response timeouts occur. */
-    if ((hci_filter_enabled && ignore_hci_cmd(skb)))
-    {
-        if (likely(hu->list[PROTO_SH_BT]->recv != NULL))
-        {
-            if(hci_cfg_sequence_end(skb)) {
-                BT_LDISC_DBG(V4L2_DBG_INIT, "BT_CFG_END detected\n");
-                hci_filter_enabled = false;
-            }
-            /* Adjust length of hci fake response events for packets
-             * that would send back parameters. */
-            if(pkt_equals_hci_ev(skb, 0x0c14)) {
-                hci_response_data_len += READ_CMD_DATA_LEN;
-                hci_response_len += READ_CMD_DATA_LEN;
-            }
-
-            brcm->rx_skb = alloc_skb(HCI_MAX_FRAME_SIZE, GFP_ATOMIC);
-            if(brcm->rx_skb) {
-                skb_reserve(brcm->rx_skb, hci_response_len + 2);
-            }
-
-            brcm->rx_skb->dev = (void *) hu->hdev;
-            sh_ldisc_cb(brcm->rx_skb)->pkt_type = HCI_EVENT_PKT;
-
-            // Build the response: event header + command
-            ptr[0] = 0x0e;
-            ptr[1] = hci_response_data_len;
-            ptr[2] = 0x01;
-            ptr[3] = (skb->data)[1];
-            ptr[4] = (skb->data)[2];
-
-            memcpy(skb_put(brcm->rx_skb, hci_response_len), ptr, hci_response_len);
-
-            brcm_hci_process_frametype(HCI_EVENT_PKT,hu,brcm->rx_skb, hci_response_len);
-            brcm_hci_uart_route_frame(PROTO_SH_BT, hu, brcm->rx_skb);
-        }
-    }
-    else
-    {
-        if (hu->protos_registered > 1 &&
-           (sh_ldisc_cb(skb)->pkt_type == HCI_COMMAND_PKT ||
-            sh_ldisc_cb(skb)->pkt_type == FM_CH8_PKT ||
-            sh_ldisc_cb(skb)->pkt_type == ANT_PKT))
-        {
-            mutex_lock(&cmd_credit);
-            init_completion(&hu->cmd_rcvd);
-
-            hu->proto->enqueue(hu, skb);
-
-            /* forward to snoop */
-#if V4L2_SNOOP_ENABLE
-            if(nl_sk_hcisnoop)
-                brcm_hci_write(hu, skb->data, skb->len);
-#endif
-            brcm_hci_uart_tx_wakeup(hu);
-            if (!wait_for_completion_timeout(&hu->cmd_rcvd,
-                    msecs_to_jiffies(CMD_WR_TIME))) {
-                pr_err(" waiting for command response - timed out");
-                return 0;
-            }
-            mutex_unlock(&cmd_credit);
-        }
-        else
-        {
-            hu->proto->enqueue(hu, skb);
-
-            /* forward to snoop */
-#if V4L2_SNOOP_ENABLE
-            if(nl_sk_hcisnoop)
-                brcm_hci_write(hu, skb->data, skb->len);
-#endif
-            brcm_hci_uart_tx_wakeup(hu);
-        }
-    }
-
-    /* return number of bytes written */
-    return len;
+    return brcm_hci_queue_tx(hu, skb, never_blocking);
 }
+
 
 /*****************************************************************************
 **   Shared line discipline driver APIs
@@ -2039,65 +2144,81 @@ long brcm_sh_ldisc_write(struct sk_buff *skb)
 *******************************************************************************/
 static int brcm_hci_uart_tty_open(struct tty_struct *tty)
 {
-    struct hci_uart *hu;
+    struct hci_uart *hu = HU_REF;
+    struct hci_uart_proto_desc *default_proto_desc;
     unsigned long flags;
-#if V4L2_SNOOP_ENABLE
-    hc_bt_hdr *snoop_hci_hdr;
-    hc_bt_hdr *snoop_hci_recv_hdr;
-#endif
-    hu_ref(&hu, 0);
-    BT_LDISC_DBG(V4L2_DBG_INIT, "tty open %p hu %p", tty,hu);
+    int err = 0;
 
-    /* don't do an wakeup for now */
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "tty open %p hu %p", tty,hu);
+
+    if (test_and_set_bit_lock(LDISC_OPENING, &hu->flags)) {
+        return -EBUSY;
+    }
+
+    if (test_bit(LDISC_OPENED, &hu->flags)) {
+
+        BRCM_LDISC_ERR("this ldisc had been opened");
+        err = -EINVAL;
+        goto out;
+    }
+
+    hu->tx_wq = alloc_ordered_workqueue("brcm_ldisc_tx", 0);
+    if (!hu->tx_wq) {
+        BRCM_LDISC_ERR("could not allocate memory for tx_wq");
+        err = -ENOMEM;
+        goto out;
+    }
+
+    /* don't do an wakeup at this point */
     clear_bit(TTY_DO_WRITE_WAKEUP, &tty->flags);
 
     tty->disc_data = hu;
     hu->tty = tty;
-    BT_LDISC_DBG(V4L2_DBG_INIT, "tty open %p hu %p", tty,hu);
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "tty open %p hu %p", tty,hu);
     tty->receive_room = N_TTY_BUF_SIZE;
 
-    spin_lock_irqsave(&reg_lock, flags);
-    spin_unlock_irqrestore(&reg_lock, flags);
-
-    spin_lock_init(&hu->rx_lock);
-    spin_lock_init(&hu->lock);
+    hu->tx_on = true;
+    INIT_WORK(&hu->tx_work, brcm_hci_uart_tx_work_handler);
 
 #if V4L2_SNOOP_ENABLE
     spin_lock_init(&hu->hcisnoop_lock);
-    spin_lock_init(&hu->hcisnoop_write_lock);
 #endif
 
     /* Flush any pending characters in the driver and line discipline. */
-    if (tty->ldisc->ops->flush_buffer)
-        tty->ldisc->ops->flush_buffer(tty);
+    tty_ldisc_flush(tty);
     tty_driver_flush_buffer(tty);
 
-#if V4L2_SNOOP_ENABLE
-    /* used to create header in snoop */
-    snoop_hci_hdr = kzalloc(V4L2_HCI_PKT_MAX_SIZE, GFP_ATOMIC);
-    if (!snoop_hci_hdr) {
-        BT_LDISC_ERR("could not allocate memory to snoop_hci_hdr");
-        return -ENOMEM;
-    }
-    else {
-        hu->snoop_hdr_data = snoop_hci_hdr;
+    default_proto_desc = hup[0];
+    /* Increasing its reference count by 1 */
+    default_proto_desc = get_proto(hu, default_proto_desc);
+    if (IS_ERR(default_proto_desc)) {
+        err = PTR_ERR(default_proto_desc);
+    } else if (default_proto_desc == NULL) {
+        err = -EFAULT;
+    } else {
+        hu->curr_proto_desc = default_proto_desc;
     }
 
-    /* used to create header for snoop during internal command response */
-    snoop_hci_recv_hdr = kzalloc(V4L2_HCI_PKT_MAX_SIZE, GFP_ATOMIC);
-    if (!snoop_hci_recv_hdr) {
-        BT_LDISC_ERR("could not allocate memory to snoop_hci_hdr");
-        return -ENOMEM;
+    if (err) {
+        BRCM_LDISC_ERR("Failed to acquire proto 0 as the default one");
+        goto out;
     }
-    else {
-        hu->hdr_data = snoop_hci_recv_hdr;
+
+    set_bit(LDISC_OPENED, &hu->flags);
+
+    /* Note that complete(&hu->ldisc_installed) also has the effect of write memory barriers */
+    complete(&hu->ldisc_installed);
+
+out:
+    if (err) {
+        if (hu->tx_wq) {
+            destroy_workqueue(hu->tx_wq);
+            hu->tx_wq = NULL;
+        }
     }
-#endif
 
-   /* installation of N_BRCM_HCI ldisc complete */
-    sh_ldisc_complete(hu);
-
-    return 0;
+    clear_bit_unlock(LDISC_OPENING, &hu->flags);
+    return err;
 }
 
 /*******************************************************************************
@@ -2115,54 +2236,72 @@ static int brcm_hci_uart_tty_open(struct tty_struct *tty)
 static void brcm_hci_uart_tty_close(struct tty_struct *tty)
 {
     struct hci_uart *hu = (void *)tty->disc_data; /* assign tty instance to hci_uart */
-    int i;
+    int err = 0;
 
-    BT_LDISC_DBG(V4L2_DBG_INIT, "tty= %p", tty);
+    if (unlikely(!hu)) {
+
+        BRCM_LDISC_ERR("hci_uart ptr is null");
+        return -EINVAL;
+    }
+
+    if (test_and_set_bit_lock(LDISC_CLOSING, &hu->flags)) {
+        return -EBUSY;
+    }
+
+    if (!test_bit(LDISC_OPENED, &hu->flags)) {
+        BRCM_LDISC_ERR("ldisc is not opened");
+        err = -EINVAL;
+        goto out;
+    }
+
+    if (test_bit(LDISC_SUB_PROTO_REG_UNREG_IN_PROGRESS, &hu->flags) && !test_bit(LDISC_STOPPING, &hu->flags)) {
+        BRCM_LDISC_ERR("Closing ldisc is not allowed when sup proto registration is in progress, but ldisc is not waiting in LDISC_STOPPING state");
+        err = -EINVAL;
+        goto out;
+    }
+
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "tty= %p", tty);
+
+    hu->tx_on = false;
+    smp_wmb();
+    destroy_workqueue(hu->tx_wq);
 
     /* Detach from the tty */
     tty->disc_data = NULL;
 
     tty_ldisc_flush(tty);
-
-    if (tty->ldisc->ops->flush_buffer)
-        tty->ldisc->ops->flush_buffer(tty);
-
     tty_driver_flush_buffer(tty);
 
-#if V4L2_SNOOP_ENABLE
-    /* release memory allocated for snooping */
-    if(hu->snoop_hdr_data){
-        kfree(hu->snoop_hdr_data);
-        hu->snoop_hdr_data = NULL;
-    }
-    if(hu->hdr_data){
-        kfree(hu->hdr_data);
-        hu->hdr_data = NULL;
-    }
-#endif
-
-    if (hu)
-    {
-        if (test_and_clear_bit(HCI_UART_PROTO_SET, &hu->flags))
+    if (hu->components_registered) {
+        int i;
+        hu->components_registered = 0;
+        for (i = COMPONENT_BT; i < COMPONENT_MAX; i++)
         {
-            hu->proto->close(hu);
-            hu->protos_registered =0;
-            BT_LDISC_DBG(V4L2_DBG_CLOSE, "brcm_hci_uart_tty_close protos_registered = %d",
-                                     hu->protos_registered);
-            for (i = PROTO_SH_BT; i < PROTO_SH_MAX; i++)
-            {
-                if (hu->list[i] != NULL)
-                {
-                    BT_LDISC_ERR("%d not un-registered, unregistering now", i);
-                    remove_channel_from_table(hu,i);
-                }
-            }
+            put_component_desc(hu, i);
         }
+
+        BRCM_LDISC_DBG(V4L2_DBG_CLOSE, "brcm_hci_uart_tty_close protos_registered = 0x00");
     }
-    sh_ldisc_complete(hu);
+
+    /* This will trigger the shutdown procedure of the current selected proto:
+     * The last call to put_proto(), which might not be this one,
+     * will close the associated proto
+     */
+    put_proto(hu, NULL);
+
+    clear_bit(LDISC_OPENED, &hu->flags);
+
     hu->tty = 0;
+    /* Note that complete(&hu->ldisc_installed)/complete(&hu->tty_close_complete)
+     * also has the effect of write memory barriers
+     */
+    complete(&hu->ldisc_installed);
     complete(&hu->tty_close_complete);
-    BT_LDISC_DBG(V4L2_DBG_INIT, "tty close exit");
+
+out:
+    clear_bit_unlock(LDISC_CLOSING, &hu->flags);
+
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "tty close exit");
 }
 
 /*******************************************************************************
@@ -2208,18 +2347,17 @@ static void brcm_hci_uart_tty_receive(struct tty_struct *tty,
 {
     struct hci_uart *hu = (void *)tty->disc_data; /* assign tty instance to hci_uart */
     unsigned long lock_flags;
+    struct hci_uart_proto_desc *proto_desc;
 
     if (!hu || tty != hu->tty)
         return;
 
-    if (!test_bit(HCI_UART_PROTO_SET, &hu->flags))
-        return;
+    proto_desc = get_proto(hu, NULL);
 
-    spin_lock_irqsave(&hu->rx_lock, lock_flags);
-
-    hu->proto->recv(hu, (void *) data, count);
-
-    spin_unlock_irqrestore(&hu->rx_lock, lock_flags);
+    if (likely(!IS_ERR_OR_NULL(proto_desc))) {
+        proto_desc->proto->recv(hu, (void *) data, count);
+        put_proto(hu, proto_desc);
+    }
 
 }
 
@@ -2233,106 +2371,123 @@ static void brcm_hci_uart_tty_receive(struct tty_struct *tty,
 **    file          pointer to open file object for device
 **    cmd           IOCTL command code
 **    arg           argument for IOCTL call (cmd dependent)
-*** Returns - 0 if success, otherwise error code
+**
+** Returns - 0 if success, otherwise error code
 **
 *******************************************************************************/
 static int brcm_hci_uart_tty_ioctl(struct tty_struct *tty,
                         struct file * file, unsigned int cmd, unsigned long arg)
 {
     struct hci_uart *hu = (void *)tty->disc_data; /* assign tty instance to hci_uart */
-    int err = 0;
+    int ret = 0;
 
-    BT_LDISC_DBG(V4L2_DBG_INIT,"cmd %d", cmd);
+    BRCM_LDISC_DBG(V4L2_DBG_INIT,"cmd %d", cmd);
 
     /* Verify the status of the device */
     if (!hu)
-        return -EBADF;
+        return -EFAULT;
 
     switch (cmd)
-        {
-        case HCIUARTSETPROTO:
-            BT_LDISC_DBG(V4L2_DBG_INIT, "SETPROTO %lu hu %p", arg, hu);
-            if (!test_and_set_bit(HCI_UART_PROTO_SET, &hu->flags))
-            {
-                err = brcm_hci_uart_set_proto(hu, arg);
-                if (err) {
-                    pr_err("error set proto");
-                    clear_bit(HCI_UART_PROTO_SET, &hu->flags);
-                    return err;
+    {
+        case HCIUARTSETPROTO: {
+            void *err_ptr;
+            BRCM_LDISC_DBG(V4L2_DBG_INIT, "SETPROTO %lu hu %p", arg, hu);
+            if (arg >= HCI_UART_MAX_PROTO)
+                ret = -EPROTONOSUPPORT;
+            else {
+                struct hci_uart_proto_desc *new_desc = hup[arg];
+                if (new_desc == NULL) {
+                    ret = -ENXIO;
+                } else {
+                    /* Calling get_proto() once to increase
+                     * its reference count by 1
+                     */
+                    new_desc = get_proto(hu, new_desc);
+                    if (IS_ERR_OR_NULL(new_desc)) {
+                        ret = -EFAULT;
+                    } else {
+                        struct hci_uart_proto_desc *old_desc = hu->curr_proto_desc;
+                        hu->curr_proto_desc = new_desc;
+                        smp_wmb();
+                        /* Don't care if there is an error returned
+                         * by put_proto(), for now
+                         */
+                        put_proto(hu, old_desc);
+                    }
                 }
-            } else
-                return -EBUSY;
+            }
+
             break;
-
-        case HCIUARTGETPROTO:
-            BT_LDISC_DBG(V4L2_DBG_INIT, "GETPROTO");
-            if (test_bit(HCI_UART_PROTO_SET, &hu->flags))
-                return hu->proto->id;
-            return -EUNATCH;
-
+        }
+        case HCIUARTGETPROTO: {
+            if (!hu->curr_proto_desc)
+                ret = -EFAULT;
+            else
+                ret = hu->curr_proto_desc->proto->id;
+            break;
+        }
         case HCIUARTGETDEVICE:
-            BT_LDISC_DBG(V4L2_DBG_INIT,"GETDEVICE");
-            if (test_bit(HCI_UART_PROTO_SET, &hu->flags))
-                return hu->hdev->id;
-            return -EUNATCH;
-
+            BRCM_LDISC_DBG(V4L2_DBG_INIT,"GETDEVICE");
+            ret = hu->hdev->id;
+            break;
         default:
-            err = n_tty_ioctl_helper(tty, file, cmd, arg);
+            ret = n_tty_ioctl_helper(tty, file, cmd, arg);
             break;
     }
 
-    return err;
+    return ret;
 }
 
 /*******************************************************************************
 **
 ** Function - brcm_hci_uart_tty_read
 **
-** Description - Read interface for sh_ldisc driver. Not supported
+** Description - Reading interface for sh_ldisc driver. Not supported
 **
 *******************************************************************************/
 static ssize_t brcm_hci_uart_tty_read(struct tty_struct *tty,
        struct file *file, unsigned char __user *buf, size_t nr)
 {
-    BT_LDISC_DBG(V4L2_DBG_RX, "%s", __func__);
+    BRCM_LDISC_DBG(V4L2_DBG_RX, "%s", __func__);
 
-return 0;
+    return -EOPNOTSUPP;
 }
 
 /*******************************************************************************
 **
-** Function - brcm_hci_uart_tty_read
+** Function - brcm_hci_uart_tty_write
 **
-** Description - Read interface for sh_ldisc driver. Not supported
+** Description - Writing interface for sh_ldisc driver. Not supported
 **
 *******************************************************************************/
 static ssize_t brcm_hci_uart_tty_write(struct tty_struct *tty,
                      struct file *file, const unsigned char *data, size_t count)
 {
-    BT_LDISC_DBG(V4L2_DBG_TX, "%s", __func__);
+    BRCM_LDISC_DBG(V4L2_DBG_TX, "%s", __func__);
 
-    return 0;
+    return -EOPNOTSUPP;
 }
 
 /*******************************************************************************
 **
-** Function - brcm_hci_uart_tty_read
+** Function - brcm_hci_uart_tty_poll
 **
-** Description - Read interface for sh_ldisc driver. Not supported
+** Description - Polling interface for sh_ldisc driver. Not supported
 **
 *******************************************************************************/
 static unsigned int brcm_hci_uart_tty_poll(struct tty_struct *tty,
                     struct file *filp, poll_table *wait)
 {
-    BT_LDISC_DBG(V4L2_DBG_RX, "%s", __func__);
+    BRCM_LDISC_DBG(V4L2_DBG_RX, "%s", __func__);
 
-    return 0;
+    return -EOPNOTSUPP;
 }
+
 static void brcm_hci_uart_tty_set_termios(struct tty_struct *tty,
                                                    struct ktermios *new_termios)
 {
     struct ktermios *newktermios;
-    BT_LDISC_DBG(V4L2_DBG_INIT, "new_termios->c_ispeed = %d, "\
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "new_termios->c_ispeed = %d, "\
         "new_termios->c_ospeed = %d",
         new_termios->c_ispeed, new_termios->c_ospeed);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,7,0)
@@ -2353,9 +2508,9 @@ static int brcm_hci_uart_init( void )
     static struct tty_ldisc_ops hci_uart_ldisc;
     int err;
 
-    BT_LDISC_DBG(V4L2_DBG_INIT, "HCI BRCM UART driver ver %s", VERSION);
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "HCI BRCM UART driver ver %s", VERSION);
 
-    /* Register the tty discipline */
+    /* Registering this line discipline to tty */
 
     memset(&hci_uart_ldisc, 0, sizeof (hci_uart_ldisc));
     hci_uart_ldisc.magic        = TTY_LDISC_MAGIC;
@@ -2377,21 +2532,8 @@ static int brcm_hci_uart_init( void )
         return err;
     }
 
-#ifdef CONFIG_BT_HCIUART_H4
-    h4_init();
-#endif
-#ifdef CONFIG_BT_HCIUART_BCSP
-    bcsp_init();
-#endif
-#ifdef CONFIG_BT_HCIUART_LL
-    ll_init();
-#endif
-#ifdef CONFIG_BT_HCIUART_BRCM
     brcm_init();
-#endif
 
-    /* initialize register lock spinlock */
-    spin_lock_init(&reg_lock);
 
     return 0;
 }
@@ -2403,54 +2545,34 @@ static int brcm_hci_uart_init( void )
 static void brcm_hci_uart_exit(struct hci_uart* hu)
 {
     int err = 0;
-    BT_LDISC_DBG(V4L2_DBG_INIT, "%s", __func__);
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "%s", __func__);
 
-#ifdef CONFIG_BT_HCIUART_H4
-    h4_deinit();
-#endif
-#ifdef CONFIG_BT_HCIUART_BCSP
-    bcsp_deinit();
-#endif
-#ifdef CONFIG_BT_HCIUART_LL
-    ll_deinit();
-#endif
-#ifdef CONFIG_BT_HCIUART_BRCM
     brcm_deinit();
-#endif
 
-    kfree_skb(hu->tx_skb);
-    /* Release tty registration of line discipline */
+    /* Unregistering this line discipline from tty */
     if ((err = tty_unregister_ldisc(N_BRCM_HCI)))
-        BT_LDISC_ERR("Can't unregister HCI line discipline (%d)", err);
-}
-
-/**
- * ldisc_get_plat_device -
- *  function which returns the reference to the platform device
- *  requested by id. As of now only 1 such device exists (id=0)
- *  the context requesting for reference can get the id to be
- *  requested by a. The protocol driver which is registering or
- *  b. the tty device which is opened.
- */
-static struct platform_device *ldisc_get_plat_device(int id)
-{
-    return brcm_plt_devices[id];
+        BRCM_LDISC_ERR("Can't unregister HCI line discipline (%d)", err);
 }
 
 
-/**
- * hu_ref - reference the core's data
- *  This references the per-ST platform device in the arch/xx/
- *  board-xx.c file.
- *  This would enable multiple such platform devices to exist
- *  on a given platform
- */
-void hu_ref(struct hci_uart**priv, int id)
+/*******************************************************************************
+**
+** Function - hu_ref()
+**
+** Description - Retrieving the pointer to the core data of the designated
+**             ST platform device. This would enable the support of multiple
+**             platform devices on one signle platform
+**
+** Returns - void
+**
+*******************************************************************************/
+#if 0
+static void hu_ref(struct hci_uart**priv, int id)
 {
     struct platform_device  *pdev;
     struct hci_uart *hu;
     /* get hu reference from platform device */
-    pdev = ldisc_get_plat_device(id);
+    pdev = brcm_plt_devices[id];
     if (!pdev) {
         *priv = NULL;
         return;
@@ -2458,66 +2580,88 @@ void hu_ref(struct hci_uart**priv, int id)
     hu = dev_get_drvdata(&pdev->dev);
     *priv = hu;
 }
+#endif
 
-/**************************************************************
-* bcmbt_ldisc_probe -
-* Used for checking whether specified device hardware exists.
-***************************************************************/
-static int bcmbt_ldisc_probe(struct platform_device *pdev)
+/*******************************************************************************
+**
+** Function - brcm_ldisc_probe()
+**
+** Description - Called tor prepare the given device
+**
+** Returns - 0 if successful; a negative errno otherwise
+**
+*******************************************************************************/
+static int brcm_ldisc_probe(struct platform_device *pdev)
 {
-
-    int rc;
+    int rc = 0, pdev_index;
     struct hci_uart *hu;
-    printk("%s\n",  __func__);
-    BT_LDISC_DBG(V4L2_DBG_INIT, "%s", __func__);
-    mutex_init(&cmd_credit);
 
-    if ((pdev->id != -1) && (pdev->id < MAX_BRCM_DEVICES)) {
-        /* multiple devices could exist */
-        brcm_plt_devices[pdev->id] = pdev;
+    /*
+     * Making suer this is the platform_device created by this driver
+     */
+    if (pdev == brcm_plt_device) {
+        BRCM_LDISC_DBG(V4L2_DBG_INIT, "Binding the brcm_ldisc driver to the device %s", pdev->name);
     } else {
-        /* platform's sure about existence of 1 device */
-        brcm_plt_devices[0] = pdev;
+        BRCM_LDISC_ERR("Unknown device %s; skipped", pdev->name);
+        return -EINVAL;
     }
 
-    hu = kzalloc(sizeof(struct hci_uart), GFP_ATOMIC);
-    memset(hu, 0, sizeof(struct hci_uart));
+    hu = kzalloc(sizeof(struct hci_uart), GFP_KERNEL);
     if (!hu) {
-        pr_err("no mem to allocate");
-        return -ENOMEM;
+        BRCM_LDISC_ERR("no mem to allocate");
+        rc = -ENOMEM;
+        goto out;
     }
     dev_set_drvdata(&pdev->dev, hu);
 
-    BT_LDISC_DBG(V4L2_DBG_INIT, "%s calling brcm_hci_uart_init ", __func__);
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "%s calling brcm_hci_uart_init ", __func__);
 
     /* register the tty line discipline driver */
     rc = brcm_hci_uart_init();
     if (rc) {
-        pr_err("%s: brcm_hci_uart_init failed\n", __func__);
-        return -1;
+        BRCM_LDISC_ERR("%s: brcm_hci_uart_init failed\n", __func__);
+        goto error_uart_init;
     }
 
-    /* get reference of pdev for request_firmware
-     */
+    /* get reference of pdev for request_firmware */
     hu->brcm_pdev = pdev;
-    init_completion(&hu->cmd_rcvd);
     init_completion(&hu->ldisc_installed);
     init_completion(&hu->tty_close_complete);
 
+		spin_lock_init(&hu->component_descs_lock);
+
     rc = sysfs_create_group(&pdev->dev.kobj, &uim_attr_grp);
     if (rc) {
-        pr_err("failed to create sysfs entries");
-        return rc;
+        BRCM_LDISC_ERR("failed to create sysfs entries");
+        goto error_sysfs;
     }
 
-    return 0;
+    goto out;
+
+error_sysfs:
+    brcm_hci_uart_exit(hu);
+error_uart_init:
+    if (hu) {
+        kfree(hu);
+        dev_set_drvdata(&pdev->dev, NULL);
+    }
+out:
+    return rc;
 }
 
-static int bcmbt_ldisc_remove(struct platform_device *pdev)
+/*******************************************************************************
+**
+** Function - brcm_ldisc_remove()
+**
+** Description - Called to release the given device
+**
+** Returns - 0
+**
+*******************************************************************************/
+static int brcm_ldisc_remove(struct platform_device *pdev)
 {
     struct hci_uart* hu;
-    BT_LDISC_DBG(V4L2_DBG_INIT, "bcmbt_ldisc_remove() unloading ");
-    mutex_destroy(&cmd_credit);
+    BRCM_LDISC_DBG(V4L2_DBG_INIT, "brcm_ldisc_remove() unloading ");
 #if V4L2_SNOOP_ENABLE
     if(ldisc_snoop_enable_param)
     {
@@ -2529,32 +2673,75 @@ static int bcmbt_ldisc_remove(struct platform_device *pdev)
     hu = dev_get_drvdata(&pdev->dev);
     sysfs_remove_group(&pdev->dev.kobj, &uim_attr_grp);
     brcm_hci_uart_exit(hu);
+
     kfree(hu);
-    hu  = NULL;
     return 0;
 }
 
-static const struct of_device_id bcmbt_ldisc_dt_ids[] = {
-    { .compatible = "bcmbt_ldisc"},
+#if 0
+static const struct of_device_id brcm_ldisc_dt_ids[] = {
+    { .compatible = "brcm_ldisc"},
     {}
 };
+#endif
 
-/* Sys_fs entry bcm_ldisc. The Line discipline driver sets this to 1 when bluedroid performs open on BT
-  * protocol driver or application performs open on FM v4l2 driver */
-/* Note: This entry is used in bt_hci_bdroid.c (Android source). Also present in
- *  brcm_sh_ldisc.c (v4l2_drivers) and board specific file (android kernel source) */
-static struct platform_driver bcmbt_ldisc_platform_driver = {
-    .probe = bcmbt_ldisc_probe,
-    .remove = bcmbt_ldisc_remove,
+
+static struct platform_driver brcm_ldisc_platform_driver = {
+    //.probe = brcm_ldisc_probe,
+    .remove = brcm_ldisc_remove,
     .driver = {
-           .name = "bcm_ldisc",
+           .name = "brcm_ldisc",
            .owner = THIS_MODULE,
-           .of_match_table = bcmbt_ldisc_dt_ids,
+           //.of_match_table = brcm_ldisc_dt_ids,
            },
 };
 
-module_platform_driver(bcmbt_ldisc_platform_driver);
+static int __init brcm_ldisc_init(void) {
+    /*
+     * Creating one fake platform device associated with this line discipline driver here
+     * instead of via dts, as this fake device requires no properties/configuration; moreover,
+     * multiple-device support is already inapplicable, due to the fact that only one device
+     * (the one bound to index 0) would ever be used in the original implementation.
+     *
+     */
 
+    /*
+     * The device name and the driver name are made the same, so that they can be matched
+     */
+    int ret = 0;
+    struct platform_device_info pdev_info = {
+        .name = brcm_ldisc_platform_driver.driver.name,
+        .id = PLATFORM_DEVID_NONE
+    };
+    brcm_plt_device = platform_device_register_full(&pdev_info);
+    if (!brcm_plt_device) {
+        ret = -ENOMEM;
+    } else if (IS_ERR(brcm_plt_device)) {
+        ret = PTR_ERR(brcm_plt_device);
+    }
+
+    if (ret) {
+        BRCM_LDISC_ERR("Failed to register the device %s, errno = %d", pdev_info.name, ret);
+    } else if ((ret = platform_driver_probe(&brcm_ldisc_platform_driver, brcm_ldisc_probe))) {
+        BRCM_LDISC_ERR("Failed to register the driver %s, errno = %d", brcm_ldisc_platform_driver.driver.name, ret);
+        platform_device_unregister(brcm_plt_device);
+        brcm_plt_device = NULL;
+    }
+
+    return ret;
+}
+
+static void __exit brcm_ldisc_exit(void) {
+    platform_driver_unregister(&brcm_ldisc_platform_driver);
+
+    if (brcm_plt_device) {
+        platform_device_unregister(brcm_plt_device);
+        brcm_plt_device = NULL;
+    }
+}
+
+module_init(brcm_ldisc_init);
+module_exit(brcm_ldisc_exit);
 
 /*****************************************************************************
 **   Module Details

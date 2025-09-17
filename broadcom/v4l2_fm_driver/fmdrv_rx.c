@@ -24,40 +24,23 @@
  *
  *******************************************************************************/
 
+#include "fmdrv_config.h"
 #include "fmdrv.h"
 #include "fmdrv_main.h"
 #include "fmdrv_rx.h"
-#include "fmdrv_config.h"
 #include "fm_public.h"
-#include "../include/v4l2_target.h"
-#include "../include/v4l2_logs.h"
+#include "v4l2_logs.h"
+#include "completion_ext.h"
 
 
 /*******************************************************************************
 **  Constants & Macros
 *******************************************************************************/
 
-#ifndef V4L2_FM_DEBUG
-#define V4L2_FM_DEBUG TRUE
-#endif
-
 /* set this module parameter to enable debug info */
 extern int fm_dbg_param;
 
-extern struct region_info region_configs[];
-
-#if V4L2_FM_DEBUG
-#define V4L2_FM_DRV_DBG(flag, fmt, arg...) \
-        do { \
-            if (fm_dbg_param & flag) \
-                printk(KERN_DEBUG "(v4l2fmdrv):%s  "fmt"\n" , \
-                                           __func__,## arg); \
-        } while(0)
-#else
-#define V4L2_FM_DRV_DBG(flag, fmt, arg...)
-#endif
-#define V4L2_FM_DRV_ERR(fmt, arg...)  printk(KERN_ERR "(v4l2fmdrv):%s  "fmt"\n" , \
-                                           __func__,## arg)
+extern const struct band_info band_configs[];
 
 const unsigned short fm_sch_step_size[] =
 {
@@ -96,7 +79,7 @@ int fm_rx_set_af_switch(struct fmdrv_ops *fmdev, u8 af_mode)
     payload = fmdev->rx.fm_rds_mask;
 
     ret = fmc_send_cmd(fmdev, FM_REG_FM_RDS_MSK, &fmdev->rx.fm_rds_mask,
-                            2, REG_WR,&fmdev->maintask_completion, NULL, NULL);
+                            2, REG_WR, NULL, NULL);
 
     if (ret < 0)
         return ret;
@@ -142,7 +125,7 @@ int fm_rx_set_snr_threshold(struct fmdrv_ops *fmdev, short snr_lvl_toset)
     }
     payload = (u16) snr_lvl_toset;
     ret = fmc_send_cmd(fmdev, FM_SEARCH_SNR, &payload, sizeof(payload),
-            REG_WR, &fmdev->maintask_completion, NULL,NULL);
+            REG_WR, NULL,NULL);
 
     if (ret < 0)
         return ret;
@@ -160,8 +143,8 @@ int fm_rx_set_snr_threshold(struct fmdrv_ops *fmdev, short snr_lvl_toset)
 */
 int check_if_valid_freq(struct fmdrv_ops *fmdev, unsigned short frequency)
 {
-    if(frequency < fmdev->rx.region.low_bound ||
-            frequency > fmdev->rx.region.high_bound)
+    if(frequency < fmdev->rx.band_config.low_bound ||
+            frequency > fmdev->rx.band_config.high_bound)
     {
         V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv)%s %d - Literally out of range", \
             __func__, FM_SET_FREQ(frequency));
@@ -176,40 +159,15 @@ int check_if_valid_freq(struct fmdrv_ops *fmdev, unsigned short frequency)
 }
 
 /*
-* Function to read the FM_RDS_FLAG registry
-*/
-int read_fm_rds_flag(struct fmdrv_ops *fmdev, unsigned short *value)
-{
-    unsigned char read_length;
-    int ret;
-    int resp_len;
-    unsigned char resp_buf [2];
-
-    read_length = FM_READ_2_BYTE_DATA;
-    ret = fmc_send_cmd(fmdev, FM_REG_FM_RDS_FLAG, &read_length,
-        sizeof(read_length), REG_RD,
-                    &fmdev->maintask_completion, &resp_buf, &resp_len);
-    *value = (unsigned short)resp_buf[0] +
-                ((unsigned short)resp_buf[1] << 8);
-    V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(fmdrv) FM Mask : 0x%x ", *value);
-    return 0;
-}
-
-/*
-* Function to read the FM_RDS_FLAG registry
+* Function to set what FM_RDS_FLAG interrupt events should be reported;
+* note that once a event is reported, its flag is automatically
+* reset internally and has to be set again to reactivate it
 */
 int fm_rx_set_mask(struct fmdrv_ops *fmdev, unsigned short mask)
 {
-    int ret;
-    unsigned short flag;
-
-    fmdev->rx.fm_rds_flag|= FM_RDS_FLAG_CLEAN_BIT; /* clean FM_RDS_FLAG */
-    ret = read_fm_rds_flag(fmdev, &flag);
-    FM_CHECK_SEND_CMD_STATUS(ret);
-
-    ret = fmc_send_cmd(fmdev, FM_REG_FM_RDS_MSK, &mask, sizeof(mask), REG_WR,
-            &fmdev->maintask_completion, NULL, NULL);
-    FM_CHECK_SEND_CMD_STATUS(ret);
+    int ret = fmc_send_cmd(fmdev, FM_REG_FM_RDS_MSK, &mask, sizeof(mask), REG_WR,
+            NULL, NULL);
+    V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv) Update FM_RDS_MASK to 0x%04x: ret = %d", mask, ret);
     return ret;
 }
 
@@ -218,7 +176,7 @@ int fm_rx_set_mask(struct fmdrv_ops *fmdev, unsigned short mask)
 * (SEEK or TUNE). This method is internally called by fm_rx_set_frequency()
 * and fm_rx_seek_station().
 */
-int init_start_search(struct fmdrv_ops *fmdev, unsigned short start_freq,
+static int init_start_search(struct fmdrv_ops *fmdev, unsigned short start_freq,
                         unsigned char mode)
 {
     unsigned char payload;
@@ -230,7 +188,7 @@ int init_start_search(struct fmdrv_ops *fmdev, unsigned short start_freq,
         /* Set Scan mode */
         payload = FM_TUNER_NORMAL_SCAN_MODE;
         ret = fmc_send_cmd(fmdev, FM_SEARCH_METHOD, &payload, 1, REG_WR,
-                &fmdev->maintask_completion, NULL, NULL);
+                NULL, NULL);
         FM_CHECK_SEND_CMD_STATUS(ret);
 
         V4L2_FM_DRV_DBG(V4L2_DBG_TX,"(fmdev) %s FM_SEARCH_METHOD set to 0x%x",\
@@ -239,7 +197,7 @@ int init_start_search(struct fmdrv_ops *fmdev, unsigned short start_freq,
         /* Set Preset stations number to 0 */
         payload = 0;
         ret = fmc_send_cmd(fmdev, FM_REG_PRESET_MAX, &payload, 1, REG_WR,
-                &fmdev->maintask_completion, NULL, NULL);
+                NULL, NULL);
         FM_CHECK_SEND_CMD_STATUS(ret);
 
         V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdev) %s FM_REG_PRESET_MAX set to 0x%x",\
@@ -249,7 +207,7 @@ int init_start_search(struct fmdrv_ops *fmdev, unsigned short start_freq,
         payload = fmdev->rx.curr_rssi_threshold | (fmdev->rx.curr_sch_mode &
                                                           FM_SCAN_DIRECT_MASK);
         ret = fmc_send_cmd(fmdev, FM_REG_SCH_CTL0, &payload, 1, REG_WR,
-                &fmdev->maintask_completion, NULL, NULL);
+                NULL, NULL);
         FM_CHECK_SEND_CMD_STATUS(ret);
 
         V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdev) %s FM_REG_SCH_CTL0 set to 0x%x",\
@@ -257,15 +215,10 @@ int init_start_search(struct fmdrv_ops *fmdev, unsigned short start_freq,
 
     }
 
-    /* freeze interrupt event before SCH_TUNE is commanded */
-    fmdev->rx.fm_rds_flag |= FM_RDS_FLAG_SCH_FRZ_BIT;
-    /* set sch_tune pending bit */
-    fmdev->rx.fm_rds_flag |= FM_RDS_FLAG_SCH_BIT;
-
     /* Write Frequency */
     /* Write FM_REG_FM_FREQ (0x0a) register first */
     ret = fmc_send_cmd(fmdev, FM_REG_FM_FREQ, &start_freq,
-            sizeof(start_freq), REG_WR, &fmdev->maintask_completion, NULL, NULL);
+            sizeof(start_freq), REG_WR, NULL, NULL);
     FM_CHECK_SEND_CMD_STATUS(ret);
 
     V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdev) %s FM_REG_FM_FREQ set to 0x%x", \
@@ -277,20 +230,16 @@ int init_start_search(struct fmdrv_ops *fmdev, unsigned short start_freq,
     ret = fm_rx_set_mask(fmdev, tmp_fm_rds_mask);
     FM_CHECK_SEND_CMD_STATUS(ret);
 
-    /* Reset the fm_rds_flag here as for the first time we dont get
-    any interrupt during ENABLE to cleanup the bit */
-    fmdev->rx.fm_rds_flag &= ~FM_RDS_FLAG_CLEAN_BIT;
 
     /* Write FM_REG_SCH_TUNE (0x09) register */
-    /*payload = FM_TUNER_SEEK_MODE;*/ /* Scan parameter (0x02) */
+    /* payload = FM_TUNER_SEEK_MODE; */ /* Scan parameter (0x02) */
     payload = mode;
     ret = fmc_send_cmd(fmdev, FM_REG_SCH_TUNE, &payload, sizeof(payload),
-            REG_WR, &fmdev->maintask_completion, NULL, NULL);
+            REG_WR, NULL, NULL);
     FM_CHECK_SEND_CMD_STATUS(ret);
     fmdev->rx.curr_search_state = (mode == FM_TUNER_SEEK_MODE)?
         FM_STATE_SEEKING:FM_STATE_TUNING;
 
-    fmc_reset_rds_cache(fmdev);
 
     return 0;
 }
@@ -300,7 +249,7 @@ int init_start_search(struct fmdrv_ops *fmdev, unsigned short start_freq,
 * whether to wrap the search, or stop the search or return error
 * to user-space. This is called internally by fm_rx_seek_station() function.
 */
-int process_seek_event(struct fmdrv_ops *fmdev)
+static bool process_seek_event(struct fmdrv_ops *fmdev)
 {
     unsigned short tmp_freq, start_freq;
     int ret = -EINVAL;
@@ -308,25 +257,25 @@ int process_seek_event(struct fmdrv_ops *fmdev)
 
     tmp_freq = fmdev->rx.curr_freq;
     is_valid_freq = check_if_valid_freq(fmdev, tmp_freq);
-    if(((FM_SET_FREQ(tmp_freq) - 5) <= FM_SET_FREQ(fmdev->rx.region.low_bound)) ||
-       ((FM_SET_FREQ(tmp_freq) + 5)  >= FM_SET_FREQ(fmdev->rx.region.high_bound)))
+    if(((FM_SET_FREQ(tmp_freq) - 5) <= FM_SET_FREQ(fmdev->rx.band_config.low_bound)) ||
+       ((FM_SET_FREQ(tmp_freq) + 5)  >= FM_SET_FREQ(fmdev->rx.band_config.high_bound)))
     {
-        is_valid_freq = FALSE;
+        is_valid_freq = false;
     }
 
     V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(fmdrv) %s tmp:%d low:%d high:%d", __func__,\
-        tmp_freq, fmdev->rx.region.low_bound, fmdev->rx.region.high_bound);
+        tmp_freq, fmdev->rx.band_config.low_bound, fmdev->rx.band_config.high_bound);
 
     /* First check if Scan suceeded or not */
     if(fmdev->rx.curr_search_state == FM_STATE_SEEK_ERR)
     {
-        fmdev->rx.fm_rds_flag &= ~FM_RDS_FLAG_SCH_FRZ_BIT;
+        //fmdev->rx.fm_rds_flag &= ~FM_RDS_FLAG_SCH_FRZ_BIT;
         if(!fmdev->rx.seek_wrap && !is_valid_freq)
         {
             fmdev->rx.curr_search_state = FM_STATE_SEEK_ERR;
             V4L2_FM_DRV_ERR("(fmdrv) Seek ended with out of bound frequency %d",\
                 FM_SET_FREQ(tmp_freq));
-           return FALSE;
+           return false;
         }
         else if(fmdev->rx.seek_wrap && !is_valid_freq)
         {
@@ -334,7 +283,7 @@ int process_seek_event(struct fmdrv_ops *fmdev)
                 "Wrapping search again..");
 
             start_freq = (fmdev->rx.seek_direction==FM_SCAN_DOWN)?
-                (fmdev->rx.region.high_bound):(fmdev->rx.region.low_bound);
+                (fmdev->rx.band_config.high_bound):(fmdev->rx.band_config.low_bound);
             V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(fmdev) Current scanned frequency " \
                 "is out of bounds. Resetting to freq (%d) ",
                         FM_SET_FREQ(start_freq));
@@ -346,29 +295,44 @@ int process_seek_event(struct fmdrv_ops *fmdev)
                 fmdev->rx.curr_freq = 0;
                 V4L2_FM_DRV_ERR ("(fmdrv): Error starting search for Seek " \
                     "operation");
-                return FALSE;
+                return false;
             }
 
             fmdev->rx.curr_search_state = FM_STATE_SEEKING;
             V4L2_FM_DRV_DBG (V4L2_DBG_RX, "(fmdrv): Started wrapped-up Seek " \
                 "operation");
-            return TRUE;
+            return true;
         }
         else
         {
             fmdev->rx.curr_search_state = FM_STATE_SEEK_ERR;
             V4L2_FM_DRV_ERR("(fmdrv) *** ERROR :: Seek failed for %d " \
                 "frequency ***", FM_SET_FREQ(tmp_freq));
-            return FALSE;
+            return false;
         }
     }
     else
     {
         V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(fmdrv) Seek success!");
         fmdev->rx.curr_search_state = FM_STATE_SEEK_CMPL;
-        return TRUE;
+        return true;
     }
 }
+
+/* Helper Function to finish a search operation
+* (SEEK or TUNE). This method is internally called by fm_rx_set_frequency() and fm_rx_seek_station()
+*/
+static void finish_search(struct fmdrv_ops *fmdev) {
+    if (fmdev->rx.fm_rds_mask) {
+        /*
+         * Calling fm_rx_set_mask() with fm_rds_mask
+         * to have events which is indicated by its value activated again
+         */
+        fm_rx_set_mask(fmdev, fmdev->rx.fm_rds_mask);
+    }
+
+}
+
 
 /*******************************************************************************
 **  Main functions - Called by fmdrv_main and fmdrv_v4l2.
@@ -388,7 +352,7 @@ int fm_rx_read_curr_rssi_freq(struct fmdrv_ops *fmdev,
     /* Read current RSSI */
     payload = FM_READ_1_BYTE_DATA;
     ret = fmc_send_cmd(fmdev, FM_REG_RSSI, &payload, 1,
-            REG_RD, &fmdev->maintask_completion, &resp_buf[0], &resp_len);
+            REG_RD, &resp_buf[0], &resp_len);
     FM_CHECK_SEND_CMD_STATUS(ret);
     /* Calculating 2's compliment number into an absolute value number */
     fmdev->rx.curr_rssi = (unsigned char) ((0x80 - resp_buf[0]) & (~0x80));
@@ -402,7 +366,7 @@ int fm_rx_read_curr_rssi_freq(struct fmdrv_ops *fmdev,
     payload = FM_READ_2_BYTE_DATA;
     tmp_frq = 0;
     ret = fmc_send_cmd(fmdev, FM_REG_FM_FREQ, &payload, 1,
-            REG_RD, &fmdev->maintask_completion, &tmp_frq, &resp_len);
+            REG_RD, &tmp_frq, &resp_len);
     FM_CHECK_SEND_CMD_STATUS(ret);
     V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdev) FM_REG_FM_FREQ : %d", \
         FM_SET_FREQ(tmp_frq));
@@ -425,11 +389,11 @@ int fm_rx_read_curr_rssi_freq(struct fmdrv_ops *fmdev,
 int fm_rx_set_frequency(struct fmdrv_ops *fmdev, unsigned int freq_to_set)
 {
     unsigned short tmp_frq;
-    int ret = -EINVAL;
+    int ret = 0;
     unsigned long timeleft;
 
-    V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv): current region = %d",\
-        fmdev->rx.curr_region);
+    V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv): current band = %d",\
+        fmdev->rx.curr_band);
 
     if (fmdev->curr_fmmode != FM_MODE_RX)
         return -EPERM;
@@ -438,56 +402,45 @@ int fm_rx_set_frequency(struct fmdrv_ops *fmdev, unsigned int freq_to_set)
     {
         V4L2_FM_DRV_ERR("(fmdrv): Set frequency called with %d - out of "\
             "bound range (%d-%d)",
-            freq_to_set, FM_SET_FREQ(fmdev->rx.region.low_bound),
-            FM_SET_FREQ(fmdev->rx.region.high_bound));
+            freq_to_set, FM_SET_FREQ(fmdev->rx.band_config.low_bound),
+            FM_SET_FREQ(fmdev->rx.band_config.high_bound));
         return -EINVAL;
     }
 
+    reinit_completion(&fmdev->seektask_completion);
     ret = init_start_search(fmdev, tmp_frq, FM_TUNER_PRESET_MODE);
-    if(ret < 0)
+    if(ret)
     {
         V4L2_FM_DRV_ERR("(fmdrv): Error starting search for Seek operation");
-        return ret;
+        goto out;
     }
 
     /* Wait for tune ended interrupt */
-    init_completion(&fmdev->maintask_completion);
-    timeleft = wait_for_completion_timeout(&fmdev->maintask_completion,
+    timeleft = wait_for_completion_timeout(&fmdev->seektask_completion,
                            msecs_to_jiffies(FM_DRV_TX_TIMEOUT));
     if (!timeleft)
     {
         V4L2_FM_DRV_ERR("(fmdrv) Timeout(%d sec),didn't get tune ended interrupt",\
                jiffies_to_msecs(FM_DRV_TX_TIMEOUT) / 1000);
-        fmdev->rx.fm_rds_flag &= ~FM_RDS_FLAG_SCH_FRZ_BIT;
-        return -ETIMEDOUT;
+        ret = -ETIMEDOUT;
+        goto out;
     }
 
     /* First check if Tune suceeded or not */
     if(fmdev->rx.curr_search_state == FM_STATE_TUNE_ERR)
     {
-        V4L2_FM_DRV_ERR("(fmdrv) Tune failed for %d MHz frequency", \
-            FM_SET_FREQ(tmp_frq));
-        fmdev->rx.fm_rds_flag &= ~FM_RDS_FLAG_SCH_FRZ_BIT;
-        return -EAGAIN;
+        V4L2_FM_DRV_ERR("(fmdrv) Tune failed for %d MHz frequency", FM_SET_FREQ(tmp_frq));
+        ret = -EAGAIN;
+        goto out;
     }
     V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv) Set frequency done!");
-    fmdev->rx.fm_rds_flag &= ~FM_RDS_FLAG_SCH_FRZ_BIT;
 
     fm_rx_read_curr_rssi_freq(fmdev, FALSE);
-    /* Reset RDS Cache */
-    fmc_reset_rds_cache(fmdev);
 
-    if(fmdev->rx.fm_rds_mask)
-    {
-        /* Update the FM_RDS_MASK to set the earlier bits */
-        V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv) Update FM_RDS_MASK : 0x%x", \
-        fmdev->rx.fm_rds_mask);
-        ret = fmc_send_cmd(fmdev, FM_REG_FM_RDS_MSK, &fmdev->rx.fm_rds_mask,
-            sizeof(fmdev->rx.fm_rds_mask), REG_WR,
-            &fmdev->maintask_completion, NULL, NULL);
-    }
+out:
+    finish_search(fmdev);
 
-    return 0;
+    return ret;
 }
 
 /*
@@ -504,7 +457,7 @@ int fm_rx_get_frequency(struct fmdrv_ops *fmdev, unsigned int *curr_freq)
 
     payload = 2;
     ret = fmc_send_cmd(fmdev, FM_REG_FM_FREQ, &payload, 1, REG_RD,
-            &fmdev->maintask_completion, &tmp_frq, &resp_len);
+            &tmp_frq, &resp_len);
     FM_CHECK_SEND_CMD_STATUS(ret);
     V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdev) FM_REG_FM_FREQ : %d", \
         FM_SET_FREQ(tmp_frq));
@@ -543,106 +496,97 @@ int fm_rx_seek_station(struct fmdrv_ops *fmdev, unsigned char direction_upward,
         "curr_sch_mode:0x%x seek_wrap:0x%x", \
         fmdev->rx.seek_direction, fmdev->rx.curr_sch_mode, fmdev->rx.seek_wrap);
 
-    ret = fm_rx_get_frequency(fmdev, &freq);
+    fm_rx_get_frequency(fmdev, &freq);
     tmp_freq = FM_GET_FREQ(freq);
 
     if(!check_if_valid_freq(fmdev, tmp_freq))
     {
-        start_freq = (direction_upward)?(fmdev->rx.region.low_bound+
-            fm_sch_step_size[fmdev->rx.sch_step])
-            :(fmdev->rx.region.high_bound - fm_sch_step_size[fmdev->rx.sch_step]);
+        start_freq = (direction_upward)?(fmdev->rx.band_config.low_bound+
+            fm_sch_step_size[fmdev->rx.band_config.scan_step])
+            :(fmdev->rx.band_config.high_bound - fm_sch_step_size[fmdev->rx.band_config.scan_step]);
         V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdev) Current frequency is out of "\
             "bounds. Resetting to freq (%d) ", FM_SET_FREQ(start_freq));
     }
     else
     {
-        start_freq = (direction_upward)?(tmp_freq + fm_sch_step_size[fmdev->rx.sch_step])
-            :(tmp_freq - fm_sch_step_size[fmdev->rx.sch_step]);
-        if(start_freq >= fmdev->rx.region.high_bound ||
-            start_freq <= fmdev->rx.region.low_bound)
+        start_freq = (direction_upward)?(tmp_freq + fm_sch_step_size[fmdev->rx.band_config.scan_step])
+            :(tmp_freq - fm_sch_step_size[fmdev->rx.band_config.scan_step]);
+        if(start_freq >= fmdev->rx.band_config.high_bound ||
+            start_freq <= fmdev->rx.band_config.low_bound)
                 start_freq =  (direction_upward)?
-                (fmdev->rx.region.low_bound):(fmdev->rx.region.high_bound);
+                (fmdev->rx.band_config.low_bound):(fmdev->rx.band_config.high_bound);
     }
     V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv) Starting FM seek (%s) from %d..", \
         (direction_upward?"SEEKUP":"SEEKDOWN"), FM_SET_FREQ(start_freq));
 
 
 
+    reinit_completion(&fmdev->seektask_completion);
     ret = init_start_search(fmdev, start_freq, FM_TUNER_SEEK_MODE);
-    if(ret < 0)
+    if(ret)
     {
         V4L2_FM_DRV_ERR("(fmdrv): Error starting search for Seek operation");
-        return -EINVAL;
+        ret = -EINVAL;
+        goto out;
     }
 
     /* Wait for tune ended interrupt */
-    init_completion(&fmdev->seektask_completion);
     timeleft = wait_for_completion_timeout(&fmdev->seektask_completion,
                            msecs_to_jiffies(FM_DRV_RX_SEEK_TIMEOUT));
     if (!timeleft)
     {
         V4L2_FM_DRV_ERR("(fmdrv) Timeout(%d sec),didn't get seek ended interrupt",\
                jiffies_to_msecs(FM_DRV_RX_SEEK_TIMEOUT) / 1000);
-        fmdev->rx.fm_rds_flag &= ~FM_RDS_FLAG_SCH_FRZ_BIT;
-        return -ETIMEDOUT;
+        ret = -ETIMEDOUT;
+        goto out;
     }
 
     fm_rx_read_curr_rssi_freq(fmdev, FALSE);
     tmp_freq = fmdev->rx.curr_freq;
-    ret = process_seek_event(fmdev);
-    if(ret && fmdev->rx.curr_search_state == FM_STATE_SEEK_CMPL)
-    {
-        /* Reset RDS Cache */
-        fmc_reset_rds_cache(fmdev);
-        if(fmdev->rx.fm_rds_mask)
-        /* Update the FM_RDS_MASK to set the earlier bits */
-        ret = fmc_send_cmd(fmdev, FM_REG_FM_RDS_MSK, &fmdev->rx.fm_rds_mask,
-            sizeof(fmdev->rx.fm_rds_mask), REG_WR,
-            &fmdev->maintask_completion, NULL, NULL);
-        return 0;
-    }
-    if(!ret)
-    {
+    reinit_completion(&fmdev->seektask_completion);
+    if(!process_seek_event(fmdev)) {
         V4L2_FM_DRV_ERR("(fmdrv) Error during Seek. Try again!");
-        return -EAGAIN;
+        ret = -EAGAIN;
     }
-    else if(ret && fmdev->rx.curr_search_state == FM_STATE_SEEKING)
+    else
     {
+        if (fmdev->rx.curr_search_state == FM_STATE_SEEKING) {
 
-        /* Wait for tune ended interrupt */
-        init_completion(&fmdev->seektask_completion);
-        timeleft = wait_for_completion_timeout(&fmdev->seektask_completion,
+            /* Wait for tune ended interrupt */
+            timeleft = wait_for_completion_timeout(&fmdev->seektask_completion,
                                msecs_to_jiffies(FM_DRV_RX_SEEK_TIMEOUT));
 
-        fmdev->rx.fm_rds_flag &= ~FM_RDS_FLAG_SCH_FRZ_BIT;
-        if (!timeleft)
-        {
-            V4L2_FM_DRV_ERR("(fmdrv) Timeout(%d sec),didn't get Seek ended "\
-                "interrupt", jiffies_to_msecs(FM_DRV_RX_SEEK_TIMEOUT) / 1000);
-            return -ETIMEDOUT;
-        }
+            if (!timeleft)
+            {
+                V4L2_FM_DRV_ERR("(fmdrv) Timeout(%d sec),didn't get Seek ended "\
+                    "interrupt", jiffies_to_msecs(FM_DRV_RX_SEEK_TIMEOUT) / 1000);
+                ret = -ETIMEDOUT;
+                goto out;
+            }
 
-        fm_rx_read_curr_rssi_freq(fmdev, FALSE);
+            fm_rx_read_curr_rssi_freq(fmdev, FALSE);
 
-        /* First check if Scan suceeded or not */
-        if(fmdev->rx.curr_search_state == FM_STATE_SEEK_ERR)
-        {
-            V4L2_FM_DRV_ERR("(fmdrv) Wrap Seek failed for %d frequency", \
-                FM_SET_FREQ(fmdev->rx.curr_freq));
-            return -EAGAIN;
+            /* First check if Scan suceeded or not */
+            if(fmdev->rx.curr_search_state == FM_STATE_SEEK_ERR)
+            {
+                V4L2_FM_DRV_ERR("(fmdrv) Wrap Seek failed for %d frequency", \
+                    FM_SET_FREQ(fmdev->rx.curr_freq));
+                ret = -EAGAIN;
+            } else {
+               V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv) Wrap Seek done!");
+            }
+
+        } else if (fmdev->rx.curr_search_state != FM_STATE_SEEK_CMPL) {
+            V4L2_FM_DRV_ERR("(fmdrv) Unhandled case in Seek");
+            ret = -EINVAL;
         }
-        V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv) Wrap Seek done!");
-        /* Reset RDS Cache */
-        fmc_reset_rds_cache(fmdev);
-        /* Update the FM_RDS_MASK to set the earlier bits */
-        ret = fmc_send_cmd(fmdev, FM_REG_FM_RDS_MSK, &fmdev->rx.fm_rds_mask,
-            sizeof(fmdev->rx.fm_rds_mask), REG_WR,
-            &fmdev->maintask_completion, NULL, NULL);
-        return 0;
     }
 
-    V4L2_FM_DRV_ERR("(fmdrv) Unhandled case in Seek");
-    return -EINVAL;
+
+out:
+    finish_search(fmdev);
+
+    return ret;
 }
 
 /*
@@ -651,14 +595,14 @@ int fm_rx_seek_station(struct fmdrv_ops *fmdev, unsigned char direction_upward,
 int fm_rx_set_band_frequencies(struct fmdrv_ops *fmdev,
                          unsigned int low_freq, unsigned int high_freq)
 {
-    if((fmdev->rx.region.high_bound == FM_GET_FREQ(high_freq)) &&
-        (fmdev->rx.region.low_bound = FM_GET_FREQ(low_freq)))
+    if((fmdev->rx.band_config.high_bound == FM_GET_FREQ(high_freq)) &&
+        (fmdev->rx.band_config.low_bound = FM_GET_FREQ(low_freq)))
     {
         V4L2_FM_DRV_ERR("(fmdrv) Ignoring setting the same band frequencies");
         return 0;
     }
-    fmdev->rx.region.high_bound = FM_GET_FREQ(high_freq);
-    fmdev->rx.region.low_bound = FM_GET_FREQ(low_freq);
+    fmdev->rx.band_config.high_bound = FM_GET_FREQ(high_freq);
+    fmdev->rx.band_config.low_bound = FM_GET_FREQ(low_freq);
     return 0;
 }
 
@@ -668,8 +612,8 @@ int fm_rx_set_band_frequencies(struct fmdrv_ops *fmdev,
 int fm_rx_get_band_frequencies(struct fmdrv_ops *fmdev,
                               unsigned int *low_freq,  unsigned int *high_freq)
 {
-    *high_freq= FM_SET_FREQ(fmdev->rx.region.high_bound);
-    *low_freq= FM_SET_FREQ(fmdev->rx.region.low_bound) ;
+    *high_freq= FM_SET_FREQ(fmdev->rx.band_config.high_bound);
+    *low_freq= FM_SET_FREQ(fmdev->rx.band_config.low_bound) ;
     return 0;
 }
 
@@ -703,7 +647,7 @@ int fm_rx_set_volume(struct fmdrv_ops *fmdev, unsigned short vol_to_set)
 
     payload = actual_volume & 0x1ff;
     ret = fmc_send_cmd(fmdev, FM_REG_VOLUME_CTRL, &payload, sizeof(payload),
-        REG_WR, &fmdev->maintask_completion, NULL, NULL);
+        REG_WR, NULL, NULL);
     FM_CHECK_SEND_CMD_STATUS(ret);
 
     fmdev->rx.curr_volume = vol_to_set;
@@ -738,7 +682,7 @@ int fm_rx_get_volume(struct fmdrv_ops *fmdev, unsigned short *curr_vol)
     /* Read current volume */
     read_length = FM_READ_2_BYTE_DATA;
     ret = fmc_send_cmd(fmdev, FM_REG_VOLUME_CTRL, &read_length, 1, REG_RD,
-                        &fmdev->maintask_completion, &resp_buf, &resp_len);
+                        &resp_buf, &resp_len);
     FM_CHECK_SEND_CMD_STATUS(ret);
 
     *curr_vol = fmdev->rx.curr_volume = resp_buf;
@@ -747,61 +691,62 @@ int fm_rx_get_volume(struct fmdrv_ops *fmdev, unsigned short *curr_vol)
     return ret;
 }
 
-/* Sets band (0-Europe; 1-Japan; 2-North America; 3-Russia, 4-China) */
-int fm_rx_set_region(struct fmdrv_ops *fmdev,
-            unsigned char region_to_set)
+/* Sets band (0-Europe; 1-Japan; 2-North America; 3-Russia, 4-China, 5-Italy/Thailand) */
+int fm_rx_set_band(struct fmdrv_ops *fmdev,
+            unsigned char band_to_set)
 {
     unsigned char payload = FM_STEREO_AUTO|FM_BAND_REG_WEST;
     unsigned short boundary[2];
+    struct band_info *config = NULL;
 
     int ret = -EPERM;
-    V4L2_FM_DRV_DBG(V4L2_DBG_TX,"fm_rx_set_region In region_to_set %d",\
-        region_to_set);
+    V4L2_FM_DRV_DBG(V4L2_DBG_TX,"fm_rx_set_band In band_to_set %d",\
+        band_to_set);
     if (fmdev->curr_fmmode != FM_MODE_RX)
         return ret;
 
-    if (region_to_set != FM_REGION_NA &&
-        region_to_set != FM_REGION_EUR &&
-        region_to_set != FM_REGION_JP &&
-        region_to_set != FM_REGION_RUS &&
-        region_to_set != FM_REGION_CHN &&
-        region_to_set != FM_REGION_IT)
+    if (band_to_set < FM_BAND_EUROPE || band_to_set > FM_BAND_MAX)
     {
         V4L2_FM_DRV_ERR("(fmdrv): Invalid band");
         ret = -EINVAL;
         return ret;
     }
 
-    if (region_to_set == FM_REGION_JP ||
-        region_to_set == FM_REGION_RUS ||
-        region_to_set == FM_REGION_CHN)
-    {
-        /* set the low bound and high bound */
-        memcpy(&fmdev->rx.region, &region_configs[region_to_set], sizeof(struct region_info));
-        boundary[0] = fmdev->rx.region.high_bound;
-        boundary[1] = fmdev->rx.region.low_bound;
-        fmc_send_cmd(fmdev, FM_SEARCH_BOUNDARY, boundary, sizeof(boundary), REG_WR,
-                    &fmdev->maintask_completion, NULL, NULL);
-    }
-    else {
-        /* clear low bound and high bound */
-        boundary[0] = 0;
-        boundary[1] = 0;
-        fmc_send_cmd(fmdev, FM_SEARCH_BOUNDARY, boundary, sizeof(boundary), REG_WR,
-                    &fmdev->maintask_completion, NULL, NULL);
-    }
+    config = band_configs+band_to_set;
 
-    if (region_to_set == FM_REGION_JP)/* set japan region */
-    {
-        payload |= FM_BAND_REG_EAST;
-    }
+    /* set the low bound and high bound */
+    boundary[0] = config->high_bound;
+    boundary[1] = config->low_bound;
+    ret = fmc_send_cmd(fmdev, FM_SEARCH_BOUNDARY, boundary, sizeof(boundary), REG_WR, NULL, NULL);
+    FM_CHECK_SEND_CMD_STATUS(ret);
 
     /* Send cmd to set the band  */
     ret = fmc_send_cmd(fmdev, FM_REG_FM_CTRL, &payload, sizeof(payload), REG_WR,
-        &fmdev->maintask_completion, NULL, NULL);
+        NULL, NULL);
     FM_CHECK_SEND_CMD_STATUS(ret);
 
-    fmc_update_region_info(fmdev, region_to_set);
+    payload = fm_sch_step_size[config->scan_step];
+    ret = fmc_send_cmd(fmdev, FM_REG_SCH_STEP, &payload, sizeof(payload),
+            REG_WR, NULL, NULL);
+    FM_CHECK_SEND_CMD_STATUS(ret);
+
+    // Updating audio setting as well,
+    // as different bands might be associated with different
+    // audio settings
+    ret = fm_rx_set_audio_mode(fmdev, fmdev->rx.audio_mode, band_to_set);
+    FM_CHECK_SEND_CMD_STATUS(ret);
+
+    ret = fm_rx_config_deemphasis(fmdev, config->deemphasis);
+    FM_CHECK_SEND_CMD_STATUS(ret);
+
+    /* Updating rds control */
+    ret = fm_rx_set_rds_system(fmdev,
+            (config->rds_support & FM_RBDS_BIT));
+    FM_CHECK_SEND_CMD_STATUS(ret);
+
+    memcpy(&fmdev->rx.band_config, config, sizeof(*config));
+    fmdev->rx.curr_band = band_to_set;
+    fmdev->rx.curr_freq = config->low_bound;
 
     return ret;
 }
@@ -820,7 +765,7 @@ int fm_rx_get_audio_ctrl(struct fmdrv_ops *fmdev, uint16_t *audio_ctrl)
 
     /* Send cmd to set the band  */
     ret = fmc_send_cmd(fmdev, FM_REG_AUD_CTL0, &payload, sizeof(payload), REG_RD,
-                &fmdev->maintask_completion, audio_ctrl, &resp_len);
+                audio_ctrl, &resp_len);
     FM_CHECK_SEND_CMD_STATUS(ret);
     fmdev->aud_ctrl = fmdev->rx.aud_ctrl = *audio_ctrl;
     if(ret == -ETIMEDOUT)
@@ -842,7 +787,7 @@ int fm_rx_set_audio_ctrl(struct fmdrv_ops *fmdev,uint16_t audio_ctrl)
 
     /* Send cmd to set the band  */
     ret = fmc_send_cmd(fmdev, FM_REG_AUD_CTL0, &payload, sizeof(payload), REG_WR,
-                &fmdev->maintask_completion, NULL, NULL);
+                NULL, NULL);
     FM_CHECK_SEND_CMD_STATUS(ret);
     fmdev->aud_ctrl = fmdev->rx.aud_ctrl = audio_ctrl;
     if(ret == -ETIMEDOUT)
@@ -904,7 +849,7 @@ int fm_rx_set_mute_mode(struct fmdrv_ops *fmdev,
 }
 
 /* Sets RX stereo/mono modes */
-int fm_rx_set_audio_mode(struct fmdrv_ops *fmdev, unsigned char mode)
+int fm_rx_set_audio_mode(struct fmdrv_ops *fmdev, unsigned char mode, unsigned char band)
 {
     unsigned char audio_ctrl = FM_STEREO_SWITCH|FM_STEREO_AUTO;
     int ret;
@@ -945,12 +890,11 @@ int fm_rx_set_audio_mode(struct fmdrv_ops *fmdev, unsigned char mode)
             break;
     }
     /* set the region bit */
-    audio_ctrl |= (fmdev->rx.curr_region == FM_REGION_JP) ? \
-                                FM_BAND_REG_EAST : FM_BAND_REG_WEST;
+    audio_ctrl |= (band == FM_BAND_JAPAN) ? FM_BAND_REG_EAST : FM_BAND_REG_WEST;
 
     /* Set stereo/mono mode */
     ret = fmc_send_cmd(fmdev, FM_REG_FM_CTRL, &audio_ctrl, sizeof(audio_ctrl),
-            REG_WR, &fmdev->maintask_completion, NULL, NULL);
+            REG_WR, NULL, NULL);
     FM_CHECK_SEND_CMD_STATUS(ret);
     fmdev->rx.audio_mode = mode;
     if(mode == FM_MONO_MODE)
@@ -980,7 +924,7 @@ int fm_rx_get_audio_mode(struct fmdrv_ops *fmdev, unsigned char *mode)
         return -ENOMEM;
     }
     ret = fmc_send_cmd(fmdev, FM_REG_SNR, &payload, sizeof(payload),
-            REG_RD, &fmdev->maintask_completion, &resp, &len);
+            REG_RD, &resp, &len);
     V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(fmdrv): resp(current snr) : %x", resp);
 
     if(resp<=19)
@@ -1026,8 +970,7 @@ int fm_rx_config_audio_path(struct fmdrv_ops *fmdev, unsigned char path)
 
     /* write to PCM_ROUTE register */
     ret = fmc_send_cmd(fmdev, FM_REG_PCM_ROUTE,
-            &fmdev->rx.pcm_reg, sizeof(fmdev->rx.pcm_reg), REG_WR,
-            &fmdev->maintask_completion, NULL, NULL);
+            &fmdev->rx.pcm_reg, sizeof(fmdev->rx.pcm_reg), REG_WR, NULL, NULL);
 
     FM_CHECK_SEND_CMD_STATUS(ret);
 
@@ -1067,7 +1010,9 @@ int fm_rx_config_deemphasis(struct fmdrv_ops *fmdev, unsigned long mode)
     }
 
     if (mode == FM_DEEMPHA_50U )
-        /* set to 50us by turning off 6th bit */
+        /* set to 50us by turning off 6th bit,
+         * as in FM_DEEMPHA_50U mode no extra bit needs to be on
+         */
         fmdev->rx.aud_ctrl &=  (~FM_DEEMPHA_75_ON);
     else
         /* set to 75us by turning on 6th bit */
@@ -1082,7 +1027,7 @@ int fm_rx_config_deemphasis(struct fmdrv_ops *fmdev, unsigned long mode)
 
 /*
 * Function to get the current scan step.
-* Returns FM_STEP_100KHZ or FM_STEP_200KHZ
+* Returns FM_STEP_50KHZ, FM_STEP_100KHZ or FM_STEP_200KHZ
 */
 int fm_rx_get_scan_step(struct fmdrv_ops *fmdev,
             unsigned char *step_type)
@@ -1095,13 +1040,13 @@ int fm_rx_get_scan_step(struct fmdrv_ops *fmdev,
         V4L2_FM_DRV_ERR("(fmdrv): Invalid memory");
         return -ENOMEM;
     }
-    *step_type = fmdev->rx.sch_step;
+    *step_type = fmdev->rx.band_config.scan_step;
     return 0;
 }
 
 /*
-* Sets scan step to 100 or 200 KHz based on step type :
-* FM_STEP_100KHZ or FM_STEP_200KHZ
+* Sets scan step to 50, 100 or 200 KHz based on step type :
+* FM_STEP_50KHZ, FM_STEP_100KHZ or FM_STEP_200KHZ
 */
 int fm_rx_set_scan_step(struct fmdrv_ops *fmdev,
             unsigned char step_type)
@@ -1112,17 +1057,17 @@ int fm_rx_set_scan_step(struct fmdrv_ops *fmdev,
         return -EPERM;
 
        /* turn on MUTE */
-    if (fmdev->rx.sch_step == step_type)
+    if (fmdev->rx.band_config.scan_step == step_type)
     {
         V4L2_FM_DRV_DBG(V4L2_DBG_TX, "(fmdrv): no change in scan step size");
         return 0;
     }
     payload = fm_sch_step_size[step_type];
     ret = fmc_send_cmd(fmdev, FM_REG_SCH_STEP, &payload, sizeof(payload),
-            REG_WR, &fmdev->maintask_completion, NULL, NULL);
+            REG_WR, NULL, NULL);
     FM_CHECK_SEND_CMD_STATUS(ret);
 
-    fmdev->rx.sch_step = step_type;
+    fmdev->rx.band_config.scan_step = step_type;
     return ret;
 }
 
@@ -1131,7 +1076,7 @@ int fm_rx_set_scan_step(struct fmdrv_ops *fmdev,
 *******************************************************************************/
 
 /* Sets RDS operation mode (RDS/RDBS) */
-int fm_rx_set_rds_system(struct fmdrv_ops *fmdev, unsigned char rdbs_en_dis)
+int fm_rx_set_rds_system(struct fmdrv_ops *fmdev, bool rdbs_enabled)
 {
     unsigned char payload;
     int ret;
@@ -1140,13 +1085,13 @@ int fm_rx_set_rds_system(struct fmdrv_ops *fmdev, unsigned char rdbs_en_dis)
         return -EPERM;
 
     /* Set RDS control */
-    if (rdbs_en_dis == FM_RDBS_ENABLE)
+    if (rdbs_enabled)
         payload = (FM_RDS_CTRL_RBDS|FM_RDS_CTRL_FIFO_FLUSH);
     else
         payload = FM_RDS_CTRL_FIFO_FLUSH;
 
     ret = fmc_send_cmd(fmdev, FM_REG_RDS_CTL0, &payload, sizeof(payload),
-                        REG_WR, &fmdev->maintask_completion, NULL, NULL);
+                        REG_WR, NULL, NULL);
     FM_CHECK_SEND_CMD_STATUS(ret);
 
     return 0;
@@ -1155,23 +1100,30 @@ int fm_rx_set_rds_system(struct fmdrv_ops *fmdev, unsigned char rdbs_en_dis)
 /*
 * Function to enable RDS. Called during FM enable.
 */
-void fm_rx_enable_rds(struct fmdrv_ops *fmdev)
+void fm_rx_enable_rds(struct fmdrv_ops *fmdev, bool enabling)
 {
     unsigned char payload;
     int ret = 0;
-    if(fmdev->rx.fm_func_mask & (FM_RDS_BIT | FM_RBDS_BIT))
+    if(enabling)
     {
         payload = FM_RDS_UPD_TUPLE;
         /* write RDS FIFO waterline in depth of RDS tuples */
         ret = fmc_send_cmd(fmdev, FM_REG_RDS_WLINE, &payload, sizeof(payload),
-                            REG_WR, &fmdev->maintask_completion, NULL, NULL);
+                            REG_WR, NULL, NULL);
         if(ret<0)
             V4L2_FM_DRV_ERR("(fmdrv) Error writing to RDS FIFO waterline "\
             "register");
-        /* drain RDS FIFO */
+        /*
+         * drain RDS FIFO.
+         * Note that this draining does not seem necessary
+         * and based on tests it might disrupt the rds
+         * event reporting; therefore it is commented out
+         */
+        /*
         payload = FM_RDS_FIFO_MAX;
-        ret = fmc_send_cmd(fmdev, FM_REG_RDS_DATA, &payload, 1,
-                            REG_RD, &fmdev->maintask_completion, NULL, NULL);
+        ret = fmc_send_cmd(fmdev, FM_REG_RDS_DATA, &payload, sizeof(payload),
+                            REG_RD, NULL, NULL);
+        */
 
         /* set new FM_RDS mask so that RDS read */
         fmdev->rx.fm_rds_mask |= I2C_MASK_RDS_FIFO_WLINE_BIT;
@@ -1181,27 +1133,6 @@ void fm_rx_enable_rds(struct fmdrv_ops *fmdev)
         V4L2_FM_DRV_ERR("(fmdrv) RDS not enabled during FM enable");
         fmdev->rx.fm_rds_mask &= ~I2C_MASK_RDS_FIFO_WLINE_BIT;
     }
+
     fm_rx_set_mask(fmdev, fmdev->rx.fm_rds_mask);
-    /* Reset the fm_rds_flag here as for the first time we dont get
-    any interrupt during ENABLE to cleanup the bit */
-    fmdev->rx.fm_rds_flag &= ~FM_RDS_FLAG_CLEAN_BIT;
-
-}
-
-/*
-* Returns availability of RDS data in internel buffer.
-* If data is present in RDS buffer, return 0. Else, return -EAGAIN.
-* The V4L2 driver's poll() uses this method to determine RDS data availability.
-*/
-int fm_rx_is_rds_data_available(struct fmdrv_ops *fmdev, struct file *file,
-                  struct poll_table_struct *pts)
-{
-    poll_wait(file, &fmdev->rx.rds.read_queue, pts);
-    if (fmdev->rx.rds.rd_index != fmdev->rx.rds.wr_index) {
-        V4L2_FM_DRV_DBG(V4L2_DBG_RX, "(fmdrv) Poll success. RDS data is "\
-            "available in buffer");
-        return 0;
-    }
-    V4L2_FM_DRV_ERR("(fmdev) RDS Buffer is empty");
-    return -EAGAIN;
 }
